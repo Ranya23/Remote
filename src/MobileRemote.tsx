@@ -327,22 +327,19 @@ export default function MobileRemote() {
 
     // Phones suspend the socket when the screen locks or the tab is
     // backgrounded, which doesn't always surface as a clean TIMED_OUT
-    // event - `ready` can be left stuck at `true` even though the socket
-    // is dead. Relying on `readyRef` here to decide whether to reconnect
-    // was the bug: it skipped exactly the case this comment warns about.
-    // So always tear down and rebuild the channel the instant the app is
-    // visible again, unconditionally - a fresh subscribe is cheap, and it's
-    // the only way to guarantee Next/Prev/First/Last and the slide-map
-    // broadcast are actually flowing through a live socket, and that this
-    // device's presence entry isn't left behind as a stale "ghost" remote.
+    // event. Reconnecting the instant the app is visible again beats
+    // waiting for that to eventually fire on its own.
     const onVisibilityChange = () => {
       if (document.visibilityState !== 'visible') return;
-      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-      if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
-      setReady(false);
-      reconnectAttempt = 0;
-      fetchCurrentSessionState();
-      connect();
+      if (!readyRef.current) {
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
+        reconnectAttempt = 0;
+        fetchCurrentSessionState();
+        connect();
+      } else {
+        fetchCurrentSessionState();
+      }
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
 
