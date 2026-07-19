@@ -596,7 +596,9 @@ export default function Present() {
   // total count, per-slide type/name/notes) whenever it's built or changes.
   useEffect(() => {
     if (!flatSlides.length) return;
-    supabase.from('sessions').upsert({ id: sessionId, slide_map: flatSlides });
+    supabase.from('sessions').upsert({ id: sessionId, slide_map: flatSlides }).then(({ error }) => {
+      if (error) console.error('🚨 slide_map upsert failed:', error.message, error);
+    });
     channelRef.current?.send({ type: 'broadcast', event: 'slide_map_update', payload: { slideMap: flatSlides } });
   }, [flatSlides, sessionId]);
 

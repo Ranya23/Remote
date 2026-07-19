@@ -94,7 +94,6 @@ export default function MobileRemote() {
   // realize they're both holding the remote before they start fighting
   // over Next/Prev.
   const [otherRemoteCount, setOtherRemoteCount] = useState(0);
-  const otherRemoteDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const myClientId = useMemo(() => Math.random().toString(36).slice(2), []);
 
   const readyRef = useRef(false);
@@ -204,17 +203,7 @@ export default function MobileRemote() {
           currentSlideRef.current = data.current_slide;
         }
         if (data.file_id) setFileId(data.file_id);
-        if (Array.isArray(data.slide_map) && data.slide_map.length > 0) {
-          setFlatSlides(data.slide_map);
-        } else if (!cancelled) {
-          // The session row exists (the host creates it the instant its page
-          // loads) but slide_map hasn't been written yet - the host is still
-          // parsing the file / rendering thumbnails. This is the common case
-          // when the phone scans the QR right away, and it used to leave the
-          // remote with a permanently empty slide picker and dead
-          // Next/Prev/First/Last buttons since nothing retried from here.
-          setTimeout(() => { if (!cancelled) fetchCurrentSessionState(); }, 1500);
-        }
+        if (Array.isArray(data.slide_map)) setFlatSlides(data.slide_map);
       } else if (!cancelled) {
         // The presenter may not have finished preparing/writing the slide
         // list yet (e.g. the phone scanned the QR a moment too early).
@@ -314,21 +303,7 @@ export default function MobileRemote() {
           const entries = (state as Record<string, any[]>)[k] || [];
           return entries.some((entry) => entry?.role === 'remote');
         });
-
-        if (otherRemoteDebounceRef.current) {
-          clearTimeout(otherRemoteDebounceRef.current);
-          otherRemoteDebounceRef.current = null;
-        }
-        if (otherKeys.length === 0) {
-          // Someone left - reflect that immediately so the warning clears fast.
-          setOtherRemoteCount(0);
-        } else {
-          // A reconnect (weak wifi, phone screen locking, etc.) can very
-          // briefly show two presence entries for this exact phone while the
-          // old socket is still closing - wait a moment before flagging it
-          // as a real second device so that doesn't cause a false alarm.
-          otherRemoteDebounceRef.current = setTimeout(() => setOtherRemoteCount(otherKeys.length), 3000);
-        }
+        setOtherRemoteCount(otherKeys.length);
       });
 
       room.subscribe(async (status: string) => {
@@ -371,7 +346,6 @@ export default function MobileRemote() {
     return () => {
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (otherRemoteDebounceRef.current) clearTimeout(otherRemoteDebounceRef.current);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       if (channelRef.current) supabase.removeChannel(channelRef.current);
     };
