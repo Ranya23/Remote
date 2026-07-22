@@ -137,17 +137,22 @@ export default function FileUpload() {
             if (metaPromise && result.fileId) {
               metaPromise
                 .then((meta) => {
-                  if (!Object.keys(meta.notesByPage).length && !Object.keys(meta.transitionsByPage).length) return;
+                  if (
+                    !Object.keys(meta.notesByPage).length &&
+                    !Object.keys(meta.transitionsByPage).length &&
+                    !Object.keys(meta.buildsByPage).length
+                  ) return;
                   return supabase.from('pptx_meta').upsert({
                     file_id: result.fileId,
                     notes: meta.notesByPage,
                     transitions: meta.transitionsByPage,
+                    builds: meta.buildsByPage,
                   });
                 })
                 .catch((err) => {
-                  // Notes/transitions are a nice-to-have layered on top of a
-                  // working upload - never surface this as an upload error.
-                  console.warn('⚠️ Could not save PPTX notes/transitions (does the pptx_meta table exist yet?):', err);
+                  // Notes/transitions/builds are a nice-to-have layered on top
+                  // of a working upload - never surface this as an upload error.
+                  console.warn('⚠️ Could not save PPTX notes/transitions/builds (does the pptx_meta table have the builds column yet?):', err);
                 });
             }
           } else {

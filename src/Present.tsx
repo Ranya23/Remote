@@ -13,19 +13,30 @@ import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { supabase } from './supabaseClient';
 import { QuizReportCard, exportReportPDF, exportReportPNG, type QuizReportData } from './quizReport';
 import { recordSavedItem } from './Account';
-import type { SlideTransition } from './pptxParse';
+import type { SlideTransition, SlideBuilds, BuildRegion } from './pptxParse';
 
 // Best-effort lookup of whatever extractPptxMeta (see FileUpload.tsx) saved
-// for a given uploaded file - speaker notes and transition info, keyed by
-// slide/page number. Returns empty maps (never throws) if the table
-// doesn't exist yet, the file wasn't a pptx, or nothing was ever saved for
-// it - none of that should ever block a slide from loading.
-async function fetchPptxMeta(fileId: string): Promise<{ notesByPage: Record<number, string>; transitionsByPage: Record<number, SlideTransition> }> {
-  const empty = { notesByPage: {}, transitionsByPage: {} };
+// for a given uploaded file - speaker notes, transition info, and build
+// (bullet/object entrance) steps, keyed by slide/page number. Returns empty
+// maps (never throws) if the table doesn't exist yet, the file wasn't a
+// pptx, or nothing was ever saved for it - none of that should ever block a
+// slide from loading.
+async function fetchPptxMeta(fileId: string): Promise<{ notesByPage: Record<number, string>; transitionsByPage: Record<number, SlideTransition>; buildsByPage: Record<number, SlideBuilds> }> {
+  const empty = { notesByPage: {}, transitionsByPage: {}, buildsByPage: {} };
   try {
-    const { data, error } = await supabase.from('pptx_meta').select('notes, transitions').eq('file_id', fileId).maybeSingle();
+    let { data, error } = await supabase.from('pptx_meta').select('notes, transitions, builds').eq('file_id', fileId).maybeSingle();
+    if (error) {
+      // The `builds` column may not exist yet if supabase_migration_builds.sql
+      // hasn't been run - fall back to the original two columns so notes and
+      // transitions keep working exactly as before either way.
+      ({ data, error } = await supabase.from('pptx_meta').select('notes, transitions').eq('file_id', fileId).maybeSingle());
+    }
     if (error || !data) return empty;
-    return { notesByPage: (data.notes as Record<number, string>) || {}, transitionsByPage: (data.transitions as Record<number, SlideTransition>) || {} };
+    return {
+      notesByPage: (data.notes as Record<number, string>) || {},
+      transitionsByPage: (data.transitions as Record<number, SlideTransition>) || {},
+      buildsByPage: ((data as { builds?: Record<number, SlideBuilds> }).builds) || {},
+    };
   } catch {
     return empty;
   }
@@ -93,6 +104,7 @@ interface FlatSlide {
   name?: string;
   notes?: string;
   transition?: SlideTransition; // this slide's own PPTX transition - how it should animate IN when navigated to
+  builds?: SlideBuilds; // this slide's bullet/object entrance steps, if any - see pptxParse.ts
   thumbnail?: string; // small data-URL preview, shown on the remote's thumbnail strip
 }
 
@@ -349,6 +361,126 @@ const TRANSITION_KEYFRAMES_CSS = `
 @keyframes nextslide-slide-in-d { from { transform: translateY(-6%); opacity: 0.3; } to { transform: translateY(0); opacity: 1; } }
 `;
 
+// --- Build-step (bullet/object entrance) overlay ---------------------------
+//
+// Renders one absolutely-positioned "mask" box per not-yet-revealed region,
+// sized/positioned in percent (see pptxParse.ts - these come straight from
+// each shape's real EMU position against the slide canvas, so they line up
+// with the rendered PDF page at any size). Each mask samples the actual
+// pixel color from the already-rendered page canvas near its own edge, so
+// it hides content by genuinely matching the slide - a black background
+// stays black, white stays white, a photo background samples close to
+// whatever's actually there - rather than assuming one fixed color.
+//
+// Nothing here re-renders any text or shape - the PDF page underneath
+// already has everything laid out with the right fonts. A mask is just
+// removed (fades/drifts away) once its step is revealed, which is what
+// makes the *real*, already-typeset content appear.
+function sampleRegionColor(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, region: BuildRegion): string {
+  const candidates: Array<[number, number]> = [
+    [region.xPct, Math.max(region.yPct - 1.5, 0.3)],
+    [Math.max(region.xPct - 1.5, 0.3), region.yPct],
+    [Math.min(region.xPct + 0.5, 99.5), Math.min(region.yPct + 0.5, 99.5)],
+  ];
+  for (const [xPct, yPct] of candidates) {
+    try {
+      const x = Math.min(Math.max(Math.round((xPct / 100) * canvasW), 0), canvasW - 1);
+      const y = Math.min(Math.max(Math.round((yPct / 100) * canvasH), 0), canvasH - 1);
+      const d = ctx.getImageData(x, y, 1, 1).data;
+      return `rgb(${d[0]}, ${d[1]}, ${d[2]})`;
+    } catch {
+      continue; // shouldn't happen for a same-origin blob URL, but never let a sampling hiccup break rendering
+    }
+  }
+  return '#ffffff';
+}
+
+function buildMaskStyle(region: BuildRegion, color: string, revealed: boolean): CSSProperties {
+  const base: CSSProperties = {
+    position: 'absolute',
+    left: `${region.xPct}%`,
+    top: `${region.yPct}%`,
+    width: `${region.wPct}%`,
+    height: `${region.hPct}%`,
+    background: color,
+    opacity: revealed ? 0 : 1,
+    pointerEvents: 'none',
+  };
+  if (region.effect === 'appear') return { ...base, transition: 'opacity 80ms linear' };
+  if (region.effect === 'fade') return { ...base, transition: 'opacity 300ms ease' };
+  // fly / wipe - approximated with a small drift alongside the fade, since
+  // the real motion direction isn't something we confidently know from the
+  // file (see detectEffect in pptxParse.ts).
+  return {
+    ...base,
+    transform: revealed ? 'translateY(-6px)' : 'translateY(0)',
+    transition: 'opacity 300ms ease, transform 300ms ease',
+  };
+}
+
+function BuildOverlay({
+  flatIndex,
+  builds,
+  revealedSteps,
+  pageWrapperRef,
+  colorCacheRef,
+}: {
+  flatIndex: number;
+  builds: SlideBuilds;
+  revealedSteps: number;
+  pageWrapperRef: React.RefObject<HTMLDivElement | null>;
+  colorCacheRef: React.MutableRefObject<Map<string, string>>;
+}) {
+  const [colors, setColors] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    let attempts = 0;
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+
+    const trySample = () => {
+      const canvas = pageWrapperRef.current?.querySelector('canvas');
+      const ctx = canvas?.getContext('2d');
+      if (!canvas || !ctx || !canvas.width || !canvas.height) return false;
+      const next: Record<string, string> = {};
+      builds.steps.forEach((step, si) => {
+        step.regions.forEach((region, ri) => {
+          const key = `${flatIndex}:${si}:${ri}`;
+          const cached = colorCacheRef.current.get(key);
+          const color = cached || sampleRegionColor(ctx, canvas.width, canvas.height, region);
+          if (!cached) colorCacheRef.current.set(key, color);
+          next[key] = color;
+        });
+      });
+      if (!cancelled) setColors(next);
+      return true;
+    };
+
+    // The page's canvas may not have finished painting yet on first mount -
+    // a handful of quick retries covers that without ever blocking the
+    // occlusion boxes from showing up (they render with a plain white
+    // fallback in the meantime, then correct themselves once sampled).
+    if (!trySample()) {
+      intervalId = setInterval(() => {
+        attempts += 1;
+        if (trySample() || attempts > 15) { if (intervalId) clearInterval(intervalId); }
+      }, 100);
+    }
+    return () => { cancelled = true; if (intervalId) clearInterval(intervalId); };
+  }, [flatIndex, builds, pageWrapperRef, colorCacheRef]);
+
+  return (
+    <div className="absolute inset-0" aria-hidden="true">
+      {builds.steps.map((step, si) =>
+        step.regions.map((region, ri) => {
+          const key = `${flatIndex}:${si}:${ri}`;
+          return <div key={key} style={buildMaskStyle(region, colors[key] || '#ffffff', si < revealedSteps)} />;
+        })
+      )}
+    </div>
+  );
+}
+
 function withPlaybackParams(embedUrl: string, platform?: string): string {
   try {
     const url = new URL(embedUrl);
@@ -447,6 +579,32 @@ export default function Present() {
   // on purpose, even though currentFlatIndex itself is computed further down).
   const currentFlatIndexRef = useRef(0);
 
+  // --- Build-step (bullet/object entrance) reveal state ---------------------
+  // How many of the CURRENT flat slide's build steps have been revealed.
+  // Reset whenever currentFlatIndex actually changes (see the effect near
+  // goNext/goPrev below) - forward entry starts at 0 (nothing revealed yet,
+  // matching real PowerPoint), everything else (backing up into a slide,
+  // or any direct jump - thumbnail tap, First/Last, remote slide_change)
+  // lands "fully built", also matching real PowerPoint.
+  const [revealedSteps, setRevealedSteps] = useState(0);
+  const revealedStepsRef = useRef(0);
+  useEffect(() => { revealedStepsRef.current = revealedSteps; }, [revealedSteps]);
+  const prevFlatIndexRef = useRef(0);
+  const nextEntryModeRef = useRef<'fresh' | 'full'>('full');
+
+  // Stale-closure-free copies of goNext/goPrev (defined further down) for
+  // the mount-once realtime listener to call - same pattern as
+  // currentFlatIndexRef/flatSlidesRef above.
+  const goNextRef = useRef<() => void>(() => {});
+  const goPrevRef = useRef<() => void>(() => {});
+
+  // Sampled background color per masked region, so an occlusion box hides
+  // content by actually matching the slide (black stays black, white stays
+  // white, a photo background samples something close) instead of assuming
+  // one fixed color. Keyed by `${flatIndex}:${stepIndex}:${regionIndex}`,
+  // populated by BuildOverlay once the PDF page canvas has actually painted.
+  const regionColorCacheRef = useRef<Map<string, string>>(new Map());
+
   // --- New presentation-tools state (laser/draw already existed on the
   // remote; everything else here is new) ---------------------------------
   const [screenMode, setScreenMode] = useState<ScreenMode>('normal');
@@ -490,6 +648,11 @@ export default function Present() {
   const remoteUrl = `${window.location.origin}${window.location.pathname}#/remote?session=${sessionId}`;
   const audienceUrl = `${window.location.origin}${window.location.pathname}#/audience?session=${sessionId}`;
   const wrapperRef = useRef<HTMLDivElement>(null);
+  // Wraps just the <Page> element (shrink-wrapped to its actual rendered
+  // size, not the wider flex container around it) so BuildOverlay's percent
+  // coordinates land on the real slide box, and so it can find the page's
+  // own <canvas> to sample background colors from.
+  const pageWrapperRef = useRef<HTMLDivElement>(null);
   // Separate from wrapperRef: this is the actual target for the real
   // Fullscreen API (see the comment above the JSX that uses it). wrapperRef
   // itself stays scoped to just the slide area, since it also drives the
@@ -732,11 +895,23 @@ export default function Present() {
 
   const toggleFullscreen = () => {
     if (!fullscreenTargetRef.current) return;
-    if (!document.fullscreenElement) {
+    const entering = !document.fullscreenElement;
+    if (entering) {
       fullscreenTargetRef.current.requestFullscreen().catch(() => {});
     } else {
       document.exitFullscreen();
     }
+    // Also flip focus mode in lockstep. showNav/the sidebar were only ever
+    // gated on the real Fullscreen API's own isFullscreen flag, which only
+    // updates via a 'fullscreenchange' event - so if this ever runs in a
+    // context where requestFullscreen() is silently blocked/ignored, or the
+    // presenter extends into fullscreen afterward via the browser/OS's own
+    // toggle (F11, which never fires that event on its own), the Prev/Next/
+    // slide-name bar stayed visible. focusMode doesn't depend on any of
+    // that - it hides the chrome immediately and directly, the same way it
+    // already does today when the phone requests it.
+    setFocusMode(entering);
+    channelRef.current?.send({ type: 'broadcast', event: 'fullscreen_state', payload: { active: entering } });
   };
 
   // Theater/focus mode - hides the sidebar so the slide fills the screen.
@@ -775,6 +950,21 @@ export default function Present() {
     const idx = flatSlides.findIndex((s) => s.itemIndex === currentIndex && s.pageInItem === currentPage);
     return idx === -1 ? 0 : idx;
   }, [flatSlides, currentIndex, currentPage]);
+
+  // Guarded on the actual flat index changing (not just flatSlides being
+  // reassigned by the background loading pass) so an in-progress reveal
+  // never gets silently reset by an unrelated slide's metadata finishing
+  // to load. `nextEntryModeRef` is set to 'fresh' by goNext right before it
+  // crosses into a new slide; every other way of arriving at a slide
+  // (goPrev crossing backward, a direct remote jump, First/Last, tapping a
+  // thumbnail) leaves it at the default 'full', landing fully built.
+  useEffect(() => {
+    if (currentFlatIndex === prevFlatIndexRef.current) return;
+    const totalSteps = flatSlides[currentFlatIndex]?.builds?.steps.length ?? 0;
+    setRevealedSteps(nextEntryModeRef.current === 'fresh' ? 0 : totalSteps);
+    nextEntryModeRef.current = 'full';
+    prevFlatIndexRef.current = currentFlatIndex;
+  }, [currentFlatIndex, flatSlides]);
 
   // Redraws every stroke recorded for a given flat slide, in order, so
   // erase strokes (destination-out) correctly cut out whatever was drawn
@@ -893,6 +1083,17 @@ export default function Present() {
         } else {
           setCurrentPage(target.pageInItem);
         }
+      });
+
+      // Step delegation from the phone's own Next/Prev buttons, used only
+      // for the current slide's build steps (see MobileRemote.tsx) - the
+      // phone can't know on its own whether "next" should reveal a bullet
+      // or cross to a new slide, so it defers to whatever goNext/goPrev
+      // would do locally (same logic as the ArrowRight/ArrowLeft keys).
+      channel.on('broadcast', { event: 'nav_step' }, (payload) => {
+        const dir = payload.payload?.dir;
+        if (dir === 1) goNextRef.current();
+        else if (dir === -1) goPrevRef.current();
       });
 
       channel.on('broadcast', { event: 'laser_move' }, (payload) => {
@@ -1416,10 +1617,10 @@ export default function Present() {
           }
           if (entry.fileType === 'pdf') {
             const n = await getPdfPageCount(entry.blobUrl);
-            const { notesByPage, transitionsByPage } = await fetchPptxMeta(ref.fileId);
+            const { notesByPage, transitionsByPage, buildsByPage } = await fetchPptxMeta(ref.fileId);
             for (let p = 1; p <= n; p++) {
               const thumbnail = await renderPdfThumbnail(entry.blobUrl, p);
-              result.push({ itemIndex: i, pageInItem: p, fileType: 'pdf', name: ref.name, notes: notesByPage[p] || ref.notes, transition: transitionsByPage[p], thumbnail });
+              result.push({ itemIndex: i, pageInItem: p, fileType: 'pdf', name: ref.name, notes: notesByPage[p] || ref.notes, transition: transitionsByPage[p], builds: buildsByPage[p], thumbnail });
             }
           } else {
             const thumbnail = entry.fileType === 'image' ? await renderImageThumbnail(entry.blobUrl) : undefined;
@@ -1448,12 +1649,12 @@ export default function Present() {
     (async () => {
       if (resolved.fileType === 'pdf') {
         if (!numPages) return;
-        const { notesByPage, transitionsByPage } = fileId ? await fetchPptxMeta(fileId) : { notesByPage: {}, transitionsByPage: {} };
+        const { notesByPage, transitionsByPage, buildsByPage } = fileId ? await fetchPptxMeta(fileId) : { notesByPage: {}, transitionsByPage: {}, buildsByPage: {} };
         const slides: FlatSlide[] = [];
         for (let i = 0; i < numPages; i++) {
           if (cancelled) return;
           const thumbnail = await renderPdfThumbnail(resolved.blobUrl, i + 1);
-          slides.push({ itemIndex: 0, pageInItem: i + 1, fileType: 'pdf', notes: notesByPage[i + 1], transition: transitionsByPage[i + 1], thumbnail });
+          slides.push({ itemIndex: 0, pageInItem: i + 1, fileType: 'pdf', notes: notesByPage[i + 1], transition: transitionsByPage[i + 1], builds: buildsByPage[i + 1], thumbnail });
           if (!cancelled) setFlatSlides([...slides]);
         }
       } else if (resolved.fileType === 'image') {
@@ -1519,6 +1720,14 @@ export default function Present() {
   }, [flatSlides, currentIndex]);
 
   const goPrev = useCallback(() => {
+    // Un-reveal one build step at a time before actually leaving the slide -
+    // mirrors real PowerPoint (Back arrow first walks the current slide's
+    // animations backward, only then moves to the previous slide).
+    const totalSteps = flatSlides[currentFlatIndex]?.builds?.steps.length ?? 0;
+    if (totalSteps > 0 && revealedStepsRef.current > 0) {
+      setRevealedSteps((n) => n - 1);
+      return;
+    }
     if (flatSlides.length) { goToFlatIndex(currentFlatIndex - 1); return; }
     // Fallback for the brief window before flatSlides has been prepared.
     if (resolved?.fileType === 'pdf' && currentPage > 1) { setCurrentPage(currentPage - 1); return; }
@@ -1527,11 +1736,24 @@ export default function Present() {
   }, [flatSlides, currentFlatIndex, goToFlatIndex, resolved, currentPage, lessonSlides, currentIndex]);
 
   const goNext = useCallback(() => {
-    if (flatSlides.length) { goToFlatIndex(currentFlatIndex + 1); return; }
+    // Reveal the next build step in place before actually advancing -
+    // once every step on this slide has been shown, fall through to the
+    // normal cross-slide advance below (which plays that slide's transition
+    // exactly as it does today for non-animated content).
+    const totalSteps = flatSlides[currentFlatIndex]?.builds?.steps.length ?? 0;
+    if (totalSteps > 0 && revealedStepsRef.current < totalSteps) {
+      setRevealedSteps((n) => n + 1);
+      return;
+    }
+    if (flatSlides.length) { nextEntryModeRef.current = 'fresh'; goToFlatIndex(currentFlatIndex + 1); return; }
     if (resolved?.fileType === 'pdf' && numPages && currentPage < numPages) { setCurrentPage(currentPage + 1); return; }
     if (!lessonSlides || currentIndex >= lessonSlides.length - 1) return;
     setCurrentIndex((i) => i + 1);
   }, [flatSlides, currentFlatIndex, goToFlatIndex, resolved, numPages, currentPage, lessonSlides, currentIndex]);
+
+  // Keep the stale-closure-free copies in sync for the mount-once remote
+  // listener (see the 'nav_step' handler above) to call.
+  useEffect(() => { goNextRef.current = goNext; goPrevRef.current = goPrev; }, [goNext, goPrev]);
 
   // Keyboard shortcuts on the main screen: arrows to navigate, B/W for
   // black/white screen, Escape to restore to color.
@@ -1720,12 +1942,23 @@ export default function Present() {
                   onLoadSuccess={onPdfLoadSuccess}
                   onLoadError={(err) => setError(`PDF error: ${err.message}`)}
                 >
-                  <Page
-                    pageNumber={currentPage}
-                    renderTextLayer={false}
-                    renderAnnotationLayer={false}
-                    height={window.innerHeight * 0.85}
-                  />
+                  <div ref={pageWrapperRef} style={{ position: 'relative', display: 'inline-block', lineHeight: 0 }}>
+                    <Page
+                      pageNumber={currentPage}
+                      renderTextLayer={false}
+                      renderAnnotationLayer={false}
+                      height={window.innerHeight * 0.85}
+                    />
+                    {!!flatSlides[currentFlatIndex]?.builds?.steps.length && (
+                      <BuildOverlay
+                        flatIndex={currentFlatIndex}
+                        builds={flatSlides[currentFlatIndex]!.builds!}
+                        revealedSteps={revealedSteps}
+                        pageWrapperRef={pageWrapperRef}
+                        colorCacheRef={regionColorCacheRef}
+                      />
+                    )}
+                  </div>
                 </Document>
               </div>
             )}

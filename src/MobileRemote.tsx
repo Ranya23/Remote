@@ -17,7 +17,7 @@ const texts = {
     draw: 'کێشان', highlight: 'هایلایت', erase: 'پاکەرەوە', color: 'ڕەنگ', clear: 'سڕینەوە', timer: 'کات',
     switchLang: 'EN', connecting: 'پەیوەندی دەکرێت...', loadingPdf: 'خوێندنەوەی سلاید...', error: 'هەڵە',
     spotlight: 'تیشک', zoom: 'زووم', black: 'ڕەشکردنەوە', white: 'سپیکردنەوە', notes: 'تێبینی', hideNotes: 'شاردنەوە',
-    spotlightSize: 'قەبارە',
+    spotlightSize: 'قەبارە', hasTransition: 'گواستنەوە', buildSteps: 'ئەنیمەیشن',
     play: 'لێدان', pause: 'وەستان', mute: 'بێدەنگ', unmute: 'دەنگ', reset: 'ڕێکخستنەوە', video: 'ڤیدیۆ',
     videoLoading: 'چاوەڕوانی ڤیدیۆ بۆ دەستپێکردن...',
     startLesson: 'دەستپێکردنی وانە', startLessonSent: 'نێردرا - چاوەڕێ بە بۆ دەرکەوتنی سلایدەکان لە سەرەوە',
@@ -32,7 +32,7 @@ const texts = {
     draw: 'Draw', highlight: 'Highlight', erase: 'Erase', color: 'Color', clear: 'Clear', timer: 'Time',
     switchLang: 'کوردی', connecting: 'Connecting...', loadingPdf: 'Loading slide...', error: 'Error',
     spotlight: 'Spotlight', zoom: 'Zoom', black: 'Black screen', white: 'White screen', notes: 'Notes', hideNotes: 'Hide',
-    spotlightSize: 'Size',
+    spotlightSize: 'Size', hasTransition: 'Transition', buildSteps: 'Build steps',
     play: 'Play', pause: 'Pause', mute: 'Mute', unmute: 'Unmute', reset: 'Reset', video: 'Video',
     videoLoading: 'Waiting for video to start...',
     startLesson: 'Start the lesson and wait until slides show above', startLessonSent: 'Sent - watch the projector screen',
@@ -51,12 +51,17 @@ type CanvasDataMap = Record<number, Stroke[]>;
 
 // One entry per visible slide (mirrors the type in Present.tsx). Built and
 // shared by the host - the remote no longer guesses a fixed total.
+// `transition`/`builds` only need enough shape here to read a badge off of -
+// the host already sends the full objects over `slide_map`, this just
+// declares what we actually look at.
 interface FlatSlide {
   itemIndex: number;
   pageInItem: number;
   fileType: string;
   name?: string;
   notes?: string;
+  transition?: { kind: 'fade' | 'slide' | 'cut' };
+  builds?: { steps: unknown[] };
   thumbnail?: string;
 }
 
@@ -951,6 +956,19 @@ export default function MobileRemote() {
     await supabase.from('sessions').update({ current_slide: newSlideNumber }).eq('id', sessionId);
   };
 
+  // For a slide with build steps, this phone has no way to know on its own
+  // whether "next" should reveal the next bullet or actually cross to a new
+  // slide (that depends on how many steps the host has already revealed,
+  // which only lives on the host) - so instead of computing a target slide
+  // number, this just asks the host to do whatever its own Next/Prev would
+  // do. The host's existing slide_change broadcast (already in place today)
+  // updates currentSlide here once - and only once - the flat slide
+  // actually changes.
+  const stepSlide = async (dir: 1 | -1) => {
+    if (!ready || !channelRef.current) return;
+    await channelRef.current.send({ type: 'broadcast', event: 'nav_step', payload: { dir } });
+  };
+
   const sendPointerData = (e: React.TouchEvent | React.MouseEvent, type: 'start' | 'move' | 'end') => {
     if (!ready || !channelRef.current || activeMode === 'none' || !trackpadRef.current) return;
 
@@ -1376,22 +1394,41 @@ export default function MobileRemote() {
           (fixes "slide 6 doesn't show" for good, since this can no longer
           drift from what's actually on screen). */}
       <div className="nx-strip w-full bg-gray-900 border-b border-gray-800 p-2 overflow-x-auto flex gap-2 scroll-smooth" style={{ direction: 'ltr' }}>
-        {flatSlides.map((slide, i) => (
-          <button
-            key={i}
-            ref={(el) => { if (currentSlide === i + 1) el?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' }); }}
-            onClick={() => updateSlide(i + 1)}
-            disabled={!ready}
-            className={`min-w-[56px] h-14 rounded flex flex-col items-center justify-center font-bold text-xs gap-0.5 transition-all duration-300 overflow-hidden ${currentSlide === i + 1 ? 'bg-blue-600 text-white scale-110 shadow-lg shadow-blue-600/30' : 'bg-gray-800 text-gray-400 scale-100'} ${!ready ? 'opacity-50 cursor-not-allowed' : ''}`}
-          >
-            {slide.thumbnail ? (
-              <img src={slide.thumbnail} alt="" className="w-8 h-6 object-cover rounded-sm" />
-            ) : (
-              <span className="text-base leading-none">{TYPE_ICON[slide.fileType] || '📄'}</span>
-            )}
-            <span>{i + 1}</span>
-          </button>
-        ))}
+        {flatSlides.map((slide, i) => {
+          const buildCount = slide.builds?.steps.length ?? 0;
+          const hasTransition = !!slide.transition && slide.transition.kind !== 'cut';
+          const hasNotes = !!slide.notes;
+          return (
+            <button
+              key={i}
+              ref={(el) => { if (currentSlide === i + 1) el?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' }); }}
+              onClick={() => updateSlide(i + 1)}
+              disabled={!ready}
+              className={`min-w-[56px] h-16 rounded flex flex-col items-center justify-center font-bold text-xs gap-0.5 transition-all duration-300 overflow-hidden ${currentSlide === i + 1 ? 'bg-blue-600 text-white scale-110 shadow-lg shadow-blue-600/30' : 'bg-gray-800 text-gray-400 scale-100'} ${!ready ? 'opacity-50 cursor-not-allowed' : ''}`}
+            >
+              <div className="relative">
+                {slide.thumbnail ? (
+                  <img src={slide.thumbnail} alt="" className="w-8 h-6 object-cover rounded-sm" />
+                ) : (
+                  <span className="text-base leading-none">{TYPE_ICON[slide.fileType] || '📄'}</span>
+                )}
+                {buildCount > 0 && (
+                  <span
+                    aria-label={t.buildSteps}
+                    className="absolute -top-1.5 -right-1.5 bg-purple-600 text-white text-[8px] leading-none rounded-full min-w-[13px] h-[13px] flex items-center justify-center px-0.5"
+                  >
+                    {buildCount}
+                  </span>
+                )}
+              </div>
+              <span>{i + 1}</span>
+              <div className="flex items-center gap-0.5 h-1.5">
+                {hasNotes && <span aria-label={t.notes} className="w-1 h-1 rounded-full bg-amber-400" />}
+                {hasTransition && <span aria-label={t.hasTransition} className="w-1 h-1 rounded-full bg-sky-400" />}
+              </div>
+            </button>
+          );
+        })}
       </div>
 
       <div className="px-4 pt-3 flex gap-2">
@@ -1404,8 +1441,16 @@ export default function MobileRemote() {
       </div>
 
       <div className="p-4 grid grid-cols-2 gap-4">
-        <button disabled={!ready} onClick={() => updateSlide(currentSlide - 1)} className={`nx-chip h-20 rounded-xl bg-gray-800 text-white text-xl font-bold ${!ready ? 'opacity-50' : 'active:bg-gray-700'}`}>{t.prev}</button>
-        <button disabled={!ready} onClick={() => updateSlide(currentSlide + 1)} className={`nx-primary-btn h-20 rounded-xl bg-blue-600 text-white text-xl font-bold shadow-lg ${!ready ? 'opacity-50' : 'active:bg-blue-700'}`}>{t.next}</button>
+        <button
+          disabled={!ready}
+          onClick={() => ((activeFlat?.builds?.steps.length ?? 0) > 0 ? stepSlide(-1) : updateSlide(currentSlide - 1))}
+          className={`nx-chip h-20 rounded-xl bg-gray-800 text-white text-xl font-bold ${!ready ? 'opacity-50' : 'active:bg-gray-700'}`}
+        >{t.prev}</button>
+        <button
+          disabled={!ready}
+          onClick={() => ((activeFlat?.builds?.steps.length ?? 0) > 0 ? stepSlide(1) : updateSlide(currentSlide + 1))}
+          className={`nx-primary-btn h-20 rounded-xl bg-blue-600 text-white text-xl font-bold shadow-lg ${!ready ? 'opacity-50' : 'active:bg-blue-700'}`}
+        >{t.next}</button>
       </div>
 
       {/* Presenter notes - only shown when the active slide actually has
