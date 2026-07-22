@@ -39,20 +39,54 @@ drop policy if exists "users can update own profile" on profiles;
 create policy "users can update own profile" on profiles
   for update using (auth.uid() = id) with check (auth.uid() = id);
 
+-- Was missing entirely - the two policies above only ever covered select
+-- and update. Without an insert policy, whether the trigger below could
+-- actually write a row came down to who happened to own the table, which
+-- is exactly the kind of thing that causes signup to work in one project
+-- and fail with "Database error saving new user" in another.
+--
+-- This only opens insert up to the internal roles that create the trigger's
+-- row (supabase_auth_admin is the role GoTrue itself runs as; postgres is
+-- who a SECURITY DEFINER function runs as if the SQL editor created it;
+-- service_role is Supabase's own elevated API role) - NOT to anon/
+-- authenticated, so a regular signed-in user still can't insert an
+-- arbitrary profiles row for someone else's id over the public API.
+drop policy if exists "trigger can insert profiles" on profiles;
+create policy "trigger can insert profiles" on profiles
+  for insert
+  to supabase_auth_admin, postgres, service_role
+  with check (true);
+
+grant insert, select, update on public.profiles to supabase_auth_admin, postgres;
+
 -- Auto-create a profile row the moment someone signs up (email/password OR
 -- Google - both land here, since both create a row in auth.users).
+--
+-- Wrapped in its own exception handler: this is a best-effort convenience
+-- row, not something that should ever be able to block sign-up. Previously
+-- any failure here (missing table, a permissions issue, whatever) aborted
+-- the whole auth.users insert and surfaced to the app as a 500 "Database
+-- error saving new user" - for BOTH email/password signUp() and the Google
+-- OAuth callback, since both ultimately insert into auth.users and fire
+-- this same trigger. Now a failure here just gets logged as a Postgres
+-- warning and the account creation itself still succeeds; refreshProfile()
+-- in AuthContext.tsx will pick the row up on next load if it's missing.
 create or replace function handle_new_user()
 returns trigger
 language plpgsql
 security definer set search_path = public
 as $$
 begin
-  insert into public.profiles (id, display_name)
-  values (
-    new.id,
-    coalesce(new.raw_user_meta_data ->> 'full_name', new.raw_user_meta_data ->> 'name', split_part(new.email, '@', 1))
-  )
-  on conflict (id) do nothing;
+  begin
+    insert into public.profiles (id, display_name)
+    values (
+      new.id,
+      coalesce(new.raw_user_meta_data ->> 'full_name', new.raw_user_meta_data ->> 'name', split_part(new.email, '@', 1))
+    )
+    on conflict (id) do nothing;
+  exception when others then
+    raise warning 'handle_new_user(): could not create profile row for %: % (%)', new.id, SQLERRM, SQLSTATE;
+  end;
   return new;
 end;
 $$;

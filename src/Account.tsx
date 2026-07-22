@@ -86,6 +86,19 @@ export default function AccountPage() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
+  // Picks up the message main.tsx stashes when Supabase redirects back here
+  // with an auth error (e.g. a failed Google sign-in) instead of it just
+  // silently vanishing - see the comment in main.tsx for the full story.
+  useEffect(() => {
+    try {
+      const stashed = sessionStorage.getItem('nextslide_auth_error');
+      if (stashed) {
+        setError(stashed);
+        sessionStorage.removeItem('nextslide_auth_error');
+      }
+    } catch { /* sessionStorage unavailable - nothing to recover */ }
+  }, []);
+
   const loadItems = async (userId: string) => {
     setLoadingItems(true);
     setError('');

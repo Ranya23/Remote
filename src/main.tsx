@@ -10,6 +10,31 @@ import { supabaseConfigError } from './supabaseClient'
 // When Supabase crashes, it stops Vite from loading your CSS and buttons!
 // This creates a local fallback so your phone portal can connect perfectly.
 // ==========================================
+// When a Google sign-in (or an email confirmation / password-reset link)
+// fails on Supabase's side, it redirects back with
+// "#error=...&error_code=...&error_description=..." appended to the URL -
+// this is separate from the "?code=..." success case AuthRedirectHandler.tsx
+// handles, and Supabase always uses this hash format for errors regardless
+// of the PKCE flowType set in supabaseClient.ts. Since this app uses
+// HashRouter, that hash is exactly what react-router reads as the route to
+// match, so an error redirect showed up as "No routes matched location
+// '/error=server_error&...'" in the console and just left the page blank -
+// the actual error (e.g. "Database error saving new user") never reached
+// the person trying to sign in. This runs before the router ever mounts,
+// rewrites the hash to a real route (#/account), and stashes the message
+// so Account.tsx can show it once it loads.
+if (typeof window !== 'undefined') {
+  const rawHash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+  if (rawHash.startsWith('error=') || rawHash.includes('&error=')) {
+    const params = new URLSearchParams(rawHash);
+    const description = params.get('error_description');
+    try {
+      sessionStorage.setItem('nextslide_auth_error', description || 'Sign-in failed. Please try again.');
+    } catch { /* sessionStorage unavailable (e.g. private mode) - the redirect still gets cleaned up below */ }
+    window.location.hash = '#/account';
+  }
+}
+
 if (typeof window !== 'undefined' && !window.crypto) {
   Object.defineProperty(window, 'crypto', {
     value: {
