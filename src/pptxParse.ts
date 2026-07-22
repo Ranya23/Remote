@@ -3,25 +3,22 @@
 // PPTX is just a ZIP of XML parts. This runs once, in the browser, right at
 // upload time (see FileUpload.tsx), completely independent of the existing
 // Code.gs pipeline that converts the file to a PDF for on-screen rendering.
-// It never touches how slides are displayed - it only pulls out two things
-// Code.gs doesn't give us today:
+// It never touches how slides are displayed by default - it only pulls out
+// things Code.gs doesn't give us today:
 //
 //   1. Speaker notes per slide (ppt/notesSlides/notesSlideN.xml)
 //   2. The slide's <p:transition> effect + duration, for a CSS-based replay
 //      on "next slide" that approximates what PowerPoint itself would show
+//   3. Click-triggered BUILD animations (bullet-by-bullet / object-by-object
+//      reveals) - see the big comment above extractBuildsForSlide below for
+//      exactly what's supported and why everything else safely falls back
+//      to showing the slide fully built, instead of guessing wrong.
 //
-// Both are keyed by slide position (1-based, matching the PDF page numbers
-// Code.gs produces), and both are best-effort: if anything about a given
-// slide can't be parsed, that slide just ends up with no notes / no
-// transition (falls back to a plain cut) instead of blowing up the upload.
-//
-// NOTE ON SCOPE: this deliberately does NOT attempt full per-object,
-// per-build animation playback (individual bullet reveals, motion paths,
-// Morph, SmartArt) - that would mean replacing the PDF-page rendering
-// pipeline with a from-scratch DrawingML-to-HTML/SVG renderer, which is a
-// much larger project on its own and out of scope for this pass. What's
-// here is real: actual transition type/duration read straight out of the
-// file, applied as a real CSS transition when the presenter advances.
+// All three are keyed by slide position (1-based, matching the PDF page
+// numbers Code.gs produces), and all are best-effort: if anything about a
+// given slide can't be parsed, that slide just ends up with no notes / no
+// transition / no build info (falls back to a plain cut / fully-built slide)
+// instead of blowing up the upload.
 
 import JSZip from 'jszip';
 
@@ -32,45 +29,24 @@ export interface SlideTransition {
   direction?: 'l' | 'r' | 'u' | 'd'; // only meaningful for 'slide'
 }
 
-// --- Build (bullet/object entrance animation) steps ------------------------
-//
-// One "step" is everything that appears on a single click - usually one
-// bullet, occasionally a small group of shapes set to animate together.
-// Each step is a list of regions (percent-of-slide rectangles) that should
-// be masked until that step fires. Percent coordinates, not pixels, because
-// they're computed straight from each shape's real position in EMUs
-// (English Metric Units - PowerPoint's native unit) against the slide's
-// fixed canvas size, so they line up with the rendered PDF page regardless
-// of how large it's displayed.
-//
-// This deliberately only covers shape-level and paragraph-level ENTRANCE
-// builds (Appear/Fade/Fly/Wipe applied to a whole placeholder or one
-// bullet at a time) - by far the most common real-world use of PPTX
-// animation. Anything this can't confidently place - motion paths, exit/
-// emphasis effects, SmartArt/chart-internal animation - causes the whole
-// slide to be skipped (no `builds` entry at all), same graceful-degradation
-// philosophy as the transition parsing above: a slide we can't model
-// correctly just renders fully built, like it does today, rather than
-// revealing something in the wrong place.
-export type BuildEffect = 'fade' | 'fly' | 'wipe' | 'appear';
-export interface BuildRegion {
-  xPct: number;
-  yPct: number;
-  wPct: number;
-  hPct: number;
-  effect: BuildEffect;
-}
-export interface SlideBuildStep {
-  regions: BuildRegion[];
-}
-export interface SlideBuilds {
-  steps: SlideBuildStep[];
-}
+// One rectangle to reveal, in % of slide width/height (0-100) so it's
+// resolution-independent - the viewer just multiplies by whatever pixel
+// size the slide is actually being displayed at.
+export interface BuildBox { xPct: number; yPct: number; wPct: number; hPct: number; }
+// One "Next" press worth of reveal - almost always a single box (one bullet
+// or one object), but PowerPoint lets several things enter on the same
+// click, hence an array.
+export interface BuildStep { boxes: BuildBox[]; }
+// Presence of an entry for a given page means "this slide has a build we
+// understood well enough to trust" - absence means "render it fully built,
+// like every slide today". There's no separate on/off flag; not being here
+// *is* the fallback.
+export interface SlideBuildInfo { steps: BuildStep[]; }
 
 export interface PptxMeta {
   notesByPage: Record<number, string>;
   transitionsByPage: Record<number, SlideTransition>;
-  buildsByPage: Record<number, SlideBuilds>;
+  buildsByPage: Record<number, SlideBuildInfo>;
   slideCount: number;
 }
 
@@ -89,6 +65,22 @@ function firstEl(doc: Document | Element, tag: string): Element | null {
 }
 function allEls(doc: Document | Element, tag: string): Element[] {
   return Array.from(doc.getElementsByTagName(tag));
+}
+
+// The timing/build tree is deeply nested and re-uses the same tag names at
+// different depths (a <p:cTn> can contain other <p:cTn>s many levels down),
+// so the flat/deep lookups above are actively wrong there - we need the
+// *immediate* child with a given local name, ignoring namespace prefixes.
+function localName(el: Element): string {
+  const t = el.tagName;
+  const i = t.indexOf(':');
+  return i === -1 ? t : t.slice(i + 1);
+}
+function directChildren(el: Element, tag: string): Element[] {
+  return Array.from(el.children).filter((c) => localName(c) === tag);
+}
+function directChild(el: Element, tag: string): Element | null {
+  return directChildren(el, tag)[0] || null;
 }
 
 // Resolves "../slides/slide3.xml" (relative to ppt/_rels/) etc. into a
@@ -251,189 +243,260 @@ async function extractTransitionForSlide(zip: JSZip, slidePath: string): Promise
   }
 }
 
-// --- Build steps -----------------------------------------------------------
+// --- Build (bullet/object reveal) animations --------------------------------
+//
+// This does NOT attempt to reproduce every PowerPoint animation - that's an
+// enormous, genuinely open-ended surface (motion paths, Morph, SmartArt,
+// chart-by-series, emphasis effects on already-visible content...). Instead
+// it recognizes exactly one well-defined, extremely common pattern - "each
+// click reveals one more bullet/object, nothing else happens" - and bails
+// out (returns undefined -> slide renders fully built, exactly like today)
+// the moment anything doesn't match that pattern with confidence.
+//
+// What it needs, concretely, per click-triggered step in <p:timing>:
+//   - a real shape (<p:sp> or <p:pic>, not grouped, not a chart/table/SmartArt
+//     <p:graphicFrame>) that we can find a bounding box for - either the
+//     shape's own <a:xfrm>, or (one level of fallback) the matching
+//     placeholder's <a:xfrm> on the slide's layout
+//   - either the whole shape appearing, or a paragraph-range (<p:pRg>) within
+//     it - never finer than that (<p:charRg> = per-character = bail)
+//   - an entrance effect (presetClass="entr") - anything else (exit/emphasis
+//     mid-sequence, since our model assumes everything starts hidden and
+//     only ever gets revealed) also bails
+//
+// We deliberately don't care *how* PowerPoint enters it (fade/wipe/fly-in/
+// whatever) - the viewer always reveals it the same simple way, by removing
+// a mask (see BuildRevealOverlay.tsx). So the animation *style* PowerPoint
+// authored is not reproduced, only the *reveal order/grouping* is - which is
+// exactly the behavior the feature request asked for.
+//
+// The geometry this produces is only ever a bounding box - never the shape's
+// actual text/image content - because the viewer never re-draws the shape at
+// all. It just samples the real, already-rendered PDF page's own pixels at
+// that box and covers/uncovers them. That sidesteps needing to reproduce
+// fonts, theme colors, bullet glyphs, or backgrounds here entirely, and is
+// why this stays this short.
 
-// The slide canvas size in EMUs (<p:sldSz cx cy> on ppt/presentation.xml) -
-// every shape's percent position is computed against this. Read once per
-// upload and reused for every slide, not per-slide (it's a document-wide
-// setting).
+function slideHasPictureOrPatternBackground(slideDoc: Document): boolean {
+  const cSld = firstEl(slideDoc, 'p:cSld');
+  const bg = cSld ? directChild(cSld, 'bg') : null;
+  const bgPr = bg ? directChild(bg, 'bgPr') : null;
+  if (!bgPr) return false;
+  return !!directChild(bgPr, 'blipFill') || !!directChild(bgPr, 'pattFill');
+}
+
 async function getSlideSize(zip: JSZip): Promise<{ cx: number; cy: number } | null> {
-  try {
-    const presDoc = await readXml(zip, 'ppt/presentation.xml');
-    if (!presDoc) return null;
-    const sldSz = firstEl(presDoc, 'p:sldSz');
-    if (!sldSz) return null;
-    const cx = Number(sldSz.getAttribute('cx'));
-    const cy = Number(sldSz.getAttribute('cy'));
-    if (!cx || !cy || isNaN(cx) || isNaN(cy)) return null;
-    return { cx, cy };
-  } catch {
-    return null;
-  }
+  const presDoc = await readXml(zip, 'ppt/presentation.xml');
+  const sldSz = presDoc ? firstEl(presDoc, 'p:sldSz') : null;
+  if (!sldSz) return null;
+  const cx = Number(sldSz.getAttribute('cx'));
+  const cy = Number(sldSz.getAttribute('cy'));
+  if (!isFinite(cx) || !isFinite(cy) || cx <= 0 || cy <= 0) return null;
+  return { cx, cy };
 }
 
-interface ShapeGeom {
-  xPct: number;
-  yPct: number;
-  wPct: number;
-  hPct: number;
-  // Character count of each paragraph in this shape's text body, in order -
-  // used to proportionally split the shape's box when separate build steps
-  // target individual paragraphs (the classic "reveal one bullet at a
-  // time" case). Empty for non-text shapes (pictures, etc).
-  paragraphChars: number[];
-}
-
-// Top-level shapes only (direct children of the slide's <p:spTree>) - deep
-// enough to cover placeholders, text boxes, pictures and the occasional
-// grouped shape as one unit, which is what the vast majority of real decks
-// animate. A shape with no explicit <a:xfrm> (position inherited from the
-// layout/master) is left out entirely - we can't place it reliably, so it's
-// simply never masked, rather than guessed at.
-function collectShapeGeometry(slideDoc: Document, slideSize: { cx: number; cy: number }): Map<string, ShapeGeom> {
-  const map = new Map<string, ShapeGeom>();
-  const spTree = firstEl(slideDoc, 'p:spTree');
-  if (!spTree) return map;
-
-  for (const child of Array.from(spTree.children)) {
-    const tag = child.tagName;
-    if (!['p:sp', 'p:pic', 'p:graphicFrame', 'p:grpSp'].includes(tag)) continue;
-
-    const cNvPr = firstEl(child, 'p:cNvPr');
-    const id = cNvPr?.getAttribute('id');
-    if (!id) continue;
-
-    const xfrm = firstEl(child, 'a:xfrm') || firstEl(child, 'p:xfrm');
-    if (!xfrm) continue;
-    const off = firstEl(xfrm, 'a:off');
-    const ext = firstEl(xfrm, 'a:ext');
-    if (!off || !ext) continue;
-
-    const xEmu = Number(off.getAttribute('x'));
-    const yEmu = Number(off.getAttribute('y'));
-    const cxEmu = Number(ext.getAttribute('cx'));
-    const cyEmu = Number(ext.getAttribute('cy'));
-    if ([xEmu, yEmu, cxEmu, cyEmu].some((n) => isNaN(n))) continue;
-
-    const paragraphChars = tag === 'p:sp'
-      ? allEls(child, 'a:p').map((p) => allEls(p, 'a:t').reduce((sum, t) => sum + (t.textContent || '').length, 0))
-      : [];
-
-    map.set(id, {
-      xPct: (xEmu / slideSize.cx) * 100,
-      yPct: (yEmu / slideSize.cy) * 100,
-      wPct: (cxEmu / slideSize.cx) * 100,
-      hPct: (cyEmu / slideSize.cy) * 100,
-      paragraphChars,
-    });
+// Every <p:sp>/<p:pic>/<p:graphicFrame>/<p:grpSp> in the slide, indexed by
+// its shape id (<p:cNvPr id="...">) so animation targets (<p:spTgt spid="...">)
+// can be resolved back to an actual element.
+function buildShapeIndex(slideDoc: Document): Map<string, Element> {
+  const map = new Map<string, Element>();
+  for (const tag of ['p:sp', 'p:pic', 'p:graphicFrame', 'p:grpSp']) {
+    for (const el of allEls(slideDoc, tag)) {
+      const cNvPr = firstEl(el, 'p:cNvPr');
+      const id = cNvPr?.getAttribute('id');
+      if (id && !map.has(id)) map.set(id, el);
+    }
   }
   return map;
 }
 
-// Reads the actual animation primitive used, rather than PowerPoint's
-// numeric presetID gallery (~200 entries, not something worth hardcoding
-// from memory when it's easy to get subtly wrong) - <p:set> alone means an
-// instant "Appear", an <p:animEffect filter="fade.../wipe..."> names itself
-// directly, and <p:anim>/<p:animScale> driving position/size implies some
-// kind of "Fly"-like motion. Falls back to 'fade' - a safe, common default -
-// when nothing more specific is recognizable.
-function detectEffect(par: Element): BuildEffect {
-  const hasAnimEffect = allEls(par, 'p:animEffect').length > 0;
-  const hasAnim = allEls(par, 'p:anim').length > 0 || allEls(par, 'p:animScale').length > 0;
-  if (allEls(par, 'p:set').length && !hasAnimEffect && !hasAnim) return 'appear';
-  const animEffect = firstEl(par, 'p:animEffect');
-  const filter = animEffect?.getAttribute('filter') || '';
-  if (filter.startsWith('fade')) return 'fade';
-  if (filter.startsWith('wipe')) return 'wipe';
-  if (hasAnim) return 'fly';
-  return 'fade';
+function isInsideGroup(shapeEl: Element): boolean {
+  let node = shapeEl.parentElement;
+  while (node) {
+    const ln = localName(node);
+    if (ln === 'grpSp') return true;
+    if (ln === 'spTree') return false;
+    node = node.parentElement;
+  }
+  return false;
 }
 
-// Splits a shape's box proportionally by paragraph character count (with a
-// floor so an empty bullet still gets a sliver of height) when a build step
-// only targets some of its paragraphs - e.g. a single placeholder set to
-// reveal one bullet per click. This is an approximation (real text layout
-// depends on font/wrapping we don't have access to), but it tracks uneven
-// bullet lengths far better than an equal-height split, and it's the
-// documented trade-off, not a silent guess.
-function paragraphRangeToRegion(shape: ShapeGeom, st: number, end: number, effect: BuildEffect): BuildRegion {
-  const lengths = shape.paragraphChars.map((n) => Math.max(n, 8));
-  const total = lengths.reduce((a, b) => a + b, 0) || 1;
-  const clampedSt = Math.max(0, Math.min(st, lengths.length - 1));
-  const clampedEnd = Math.max(clampedSt, Math.min(end, lengths.length - 1));
-  let before = 0;
-  for (let i = 0; i < clampedSt; i++) before += lengths[i];
-  let within = 0;
-  for (let i = clampedSt; i <= clampedEnd; i++) within += lengths[i];
-  return {
-    xPct: shape.xPct,
-    yPct: shape.yPct + shape.hPct * (before / total),
-    wPct: shape.wPct,
-    hPct: Math.max(shape.hPct * (within / total), 1.5),
-    effect,
-  };
+function getOwnXfrm(shapeEl: Element): { x: number; y: number; cx: number; cy: number } | null {
+  const spPr = directChild(shapeEl, 'spPr') || directChild(shapeEl, 'grpSpPr');
+  const xfrm = spPr ? directChild(spPr, 'xfrm') : null;
+  const off = xfrm ? directChild(xfrm, 'off') : null;
+  const ext = xfrm ? directChild(xfrm, 'ext') : null;
+  if (!off || !ext) return null;
+  const x = Number(off.getAttribute('x'));
+  const y = Number(off.getAttribute('y'));
+  const cx = Number(ext.getAttribute('cx'));
+  const cy = Number(ext.getAttribute('cy'));
+  if ([x, y, cx, cy].some((n) => !isFinite(n))) return null;
+  return { x, y, cx, cy };
 }
 
-// One slide's worth of click-triggered build steps, read out of its own
-// <p:timing> tree. Only looks at the main click sequence
-// (p:tnLst > p:par > p:cTn[nodeType=mainSeq] > p:childTnLst) - each direct
-// child <p:par> there is one click step in the common "on click, one build
-// at a time" pattern PowerPoint generates for ordinary bullet/object
-// animation. If anything in the tree looks like something this can't
-// safely approximate (a motion path, or an exit/emphasis effect where an
-// entrance was expected), the WHOLE slide is skipped - better to show it
-// fully built, like today, than to reveal it incorrectly.
-function extractBuildsForSlide(slideDoc: Document, slideSize: { cx: number; cy: number }): SlideBuilds | undefined {
+// One-level fallback for placeholders (title/body/content boxes) that have
+// never been individually resized, and so have no <a:xfrm> of their own on
+// the slide itself - PowerPoint then draws them at the position defined on
+// the slide's layout. We stop at the layout (don't also fall back further to
+// the slide master) - if even the layout doesn't pin it down, that's rare
+// enough, and unusual enough, to just bail instead of guessing further.
+async function resolvePlaceholderXfrmFromLayout(
+  zip: JSZip,
+  slidePath: string,
+  shapeEl: Element
+): Promise<{ x: number; y: number; cx: number; cy: number } | null> {
+  const ph = firstEl(shapeEl, 'p:ph');
+  if (!ph) return null;
+  const phType = ph.getAttribute('type') || 'body';
+  const phIdx = ph.getAttribute('idx');
+
+  const slideDir = slidePath.split('/').slice(0, -1).join('/');
+  const slideFile = slidePath.split('/').pop()!;
+  const relsPath = `${slideDir}/_rels/${slideFile}.rels`;
+  const relsDoc = await readXml(zip, relsPath);
+  if (!relsDoc) return null;
+
+  let layoutPath: string | null = null;
+  for (const rel of allEls(relsDoc, 'Relationship')) {
+    if ((rel.getAttribute('Type') || '').endsWith('/slideLayout')) {
+      const target = rel.getAttribute('Target');
+      if (target) layoutPath = resolveRelPath(relsPath, target);
+      break;
+    }
+  }
+  if (!layoutPath) return null;
+  const layoutDoc = await readXml(zip, layoutPath);
+  if (!layoutDoc) return null;
+
+  for (const layoutShape of allEls(layoutDoc, 'p:sp')) {
+    const layoutPh = firstEl(layoutShape, 'p:ph');
+    if (!layoutPh) continue;
+    const lIdx = layoutPh.getAttribute('idx');
+    const lType = layoutPh.getAttribute('type') || 'body';
+    const idxMatches = phIdx != null && lIdx != null && phIdx === lIdx;
+    const typeOnlyMatches = phIdx == null && lIdx == null && phType === lType;
+    if (idxMatches || typeOnlyMatches) {
+      const xfrm = getOwnXfrm(layoutShape);
+      if (xfrm) return xfrm;
+    }
+  }
+  return null;
+}
+
+async function resolveShapeGeometry(
+  zip: JSZip,
+  slidePath: string,
+  shapeEl: Element
+): Promise<{ x: number; y: number; cx: number; cy: number } | null> {
+  return getOwnXfrm(shapeEl) || resolvePlaceholderXfrmFromLayout(zip, slidePath, shapeEl);
+}
+
+function paragraphCountFor(shapeEl: Element): number {
+  const txBody = directChild(shapeEl, 'txBody');
+  return txBody ? directChildren(txBody, 'p').length : 0;
+}
+
+async function extractBuildsForSlide(
+  zip: JSZip,
+  slidePath: string,
+  slideCx: number,
+  slideCy: number
+): Promise<SlideBuildInfo | undefined> {
   try {
+    const slideDoc = await readXml(zip, slidePath);
+    if (!slideDoc) return undefined;
+    // Cheap early bail - a photo/pattern background makes pixel-sampled
+    // masking (see BuildRevealOverlay.tsx) unreliable, so there's no point
+    // even parsing the timing tree. (Solid colors and gradients are fine,
+    // and don't need special-casing here - the viewer verifies those itself
+    // against the actual rendered pixels right before it trusts a mask.)
+    if (slideHasPictureOrPatternBackground(slideDoc)) return undefined;
+
     const timing = firstEl(slideDoc, 'p:timing');
     if (!timing) return undefined;
 
-    const shapes = collectShapeGeometry(slideDoc, slideSize);
-    if (!shapes.size) return undefined;
+    const mainSeq = allEls(timing, 'p:seq').find(
+      (s) => directChild(s, 'cTn')?.getAttribute('nodeType') === 'mainSeq'
+    );
+    if (!mainSeq) return undefined;
+    const mainCtn = directChild(mainSeq, 'cTn');
+    const childTnLst = mainCtn ? directChild(mainCtn, 'childTnLst') : null;
+    if (!childTnLst) return undefined;
+    const topPars = directChildren(childTnLst, 'par');
+    if (!topPars.length) return undefined;
 
-    const mainSeqCTn = allEls(timing, 'p:cTn').find((c) => c.getAttribute('nodeType') === 'mainSeq');
-    if (!mainSeqCTn) return undefined;
-    const mainChildLst = firstEl(mainSeqCTn, 'p:childTnLst');
-    if (!mainChildLst) return undefined;
+    const shapeIndex = buildShapeIndex(slideDoc);
+    const steps: BuildStep[] = [];
+    let currentBoxes: BuildBox[] = [];
+    let sawAnyClick = false;
 
-    const clickPars = Array.from(mainChildLst.children).filter((c) => c.tagName === 'p:par');
-    const steps: SlideBuildStep[] = [];
+    for (const par of topPars) {
+      const ctn = directChild(par, 'cTn');
+      const nodeType = ctn?.getAttribute('nodeType');
+      const presetClass = ctn?.getAttribute('presetClass');
 
-    for (const par of clickPars) {
-      if (allEls(par, 'p:animMotion').length) return undefined; // motion path - bail on the whole slide
+      // Anything other than a click-triggered step or one chained
+      // automatically off it (same step, no extra click needed) is timing
+      // machinery we don't model - bail rather than guess.
+      if (nodeType !== 'clickEffect' && nodeType !== 'withEffect' && nodeType !== 'afterEffect') return undefined;
+      // Our model assumes everything starts hidden and only ever gets
+      // revealed - an exit or emphasis effect mid-sequence breaks that
+      // assumption, so bail rather than show something wrong.
+      if (presetClass && presetClass !== 'entr') return undefined;
+      // Per-character reveals are finer-grained than a bounding-box mask
+      // can represent.
+      if (allEls(par, 'p:charRg').length) return undefined;
 
-      const presetClasses = allEls(par, 'p:cTn')
-        .map((c) => c.getAttribute('presetClass'))
-        .filter((v): v is string => !!v);
-      if (presetClasses.some((c) => c !== 'entr')) return undefined; // exit/emphasis mixed in - bail
-      if (!presetClasses.length) continue; // nothing recognizable here - skip this step, don't bail
+      if (nodeType === 'clickEffect') {
+        if (currentBoxes.length) steps.push({ boxes: currentBoxes });
+        currentBoxes = [];
+        sawAnyClick = true;
+      }
 
-      const effect = detectEffect(par);
-      const regions: BuildRegion[] = [];
-      for (const tgt of allEls(par, 'p:spTgt')) {
+      const targets = allEls(par, 'p:spTgt');
+      if (!targets.length) {
+        // A clickEffect step with nothing we can locate a shape for (e.g.
+        // it's actually a sound/media cue) can't be represented - bail. A
+        // with/afterEffect with no shape target is harmless to just skip.
+        if (nodeType === 'clickEffect') return undefined;
+        continue;
+      }
+
+      for (const tgt of targets) {
         const spid = tgt.getAttribute('spid');
-        if (!spid) continue;
-        const shape = shapes.get(spid);
-        if (!shape) continue; // couldn't place this shape - leave it unmasked, never bail over one shape
+        const shapeEl = spid ? shapeIndex.get(spid) : undefined;
+        if (!shapeEl) return undefined;
+        if (localName(shapeEl) !== 'sp' && localName(shapeEl) !== 'pic') return undefined; // graphicFrame/group - out of scope
+        if (isInsideGroup(shapeEl)) return undefined;
 
-        const txEl = firstEl(tgt, 'p:txEl');
-        const pRg = txEl ? firstEl(txEl, 'p:pRg') : null;
-        if (pRg && shape.paragraphChars.length > 0) {
+        const geometry = await resolveShapeGeometry(zip, slidePath, shapeEl);
+        if (!geometry) return undefined;
+
+        const xPct = (geometry.x / slideCx) * 100;
+        const yPct = (geometry.y / slideCy) * 100;
+        const wPct = (geometry.cx / slideCx) * 100;
+        const hPct = (geometry.cy / slideCy) * 100;
+
+        const pRg = firstEl(tgt, 'p:pRg');
+        if (pRg) {
+          const total = paragraphCountFor(shapeEl);
           const st = Number(pRg.getAttribute('st'));
           const end = Number(pRg.getAttribute('end'));
-          if (!isNaN(st) && !isNaN(end)) {
-            regions.push(paragraphRangeToRegion(shape, st, end, effect));
-            continue;
-          }
+          if (!total || !isFinite(st) || !isFinite(end) || st < 0 || end >= total || end < st) return undefined;
+          const bandH = hPct / total;
+          currentBoxes.push({ xPct, yPct: yPct + bandH * st, wPct, hPct: bandH * (end - st + 1) });
+        } else {
+          currentBoxes.push({ xPct, yPct, wPct, hPct });
         }
-        regions.push({ xPct: shape.xPct, yPct: shape.yPct, wPct: shape.wPct, hPct: shape.hPct, effect });
       }
-      if (regions.length) steps.push({ regions });
     }
+    if (currentBoxes.length) steps.push({ boxes: currentBoxes });
 
-    return steps.length ? { steps } : undefined;
+    if (!sawAnyClick || !steps.length) return undefined;
+    return { steps };
   } catch {
-    return undefined;
+    return undefined; // best-effort, same convention as notes/transitions
   }
 }
 
@@ -447,35 +510,22 @@ export async function extractPptxMeta(file: File): Promise<PptxMeta> {
     const zip = await JSZip.loadAsync(file);
     const slidePaths = await getOrderedSlidePaths(zip);
     if (!slidePaths.length) return empty;
-
     const slideSize = await getSlideSize(zip);
 
     const notesByPage: Record<number, string> = {};
     const transitionsByPage: Record<number, SlideTransition> = {};
-    const buildsByPage: Record<number, SlideBuilds> = {};
+    const buildsByPage: Record<number, SlideBuildInfo> = {};
 
     for (let i = 0; i < slidePaths.length; i++) {
       const page = i + 1;
-      const [notes, transition] = await Promise.all([
+      const [notes, transition, builds] = await Promise.all([
         extractNotesForSlide(zip, slidePaths[i]),
         extractTransitionForSlide(zip, slidePaths[i]),
+        slideSize ? extractBuildsForSlide(zip, slidePaths[i], slideSize.cx, slideSize.cy) : Promise.resolve(undefined),
       ]);
       if (notes) notesByPage[page] = notes;
       if (transition) transitionsByPage[page] = transition;
-
-      // Build steps need the slide's own XML directly (shape geometry +
-      // <p:timing>), same best-effort/never-throws contract as the notes
-      // and transition passes above - a slide this can't confidently parse
-      // just gets no `builds` entry and renders fully built, as it does today.
-      if (slideSize) {
-        try {
-          const slideDoc = await readXml(zip, slidePaths[i]);
-          const builds = slideDoc ? extractBuildsForSlide(slideDoc, slideSize) : undefined;
-          if (builds) buildsByPage[page] = builds;
-        } catch {
-          // skip - never blocks notes/transitions/the rest of the upload
-        }
-      }
+      if (builds) buildsByPage[page] = builds;
     }
 
     return { notesByPage, transitionsByPage, buildsByPage, slideCount: slidePaths.length };

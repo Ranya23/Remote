@@ -2,11 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import { supabase } from './supabaseClient';
-// Bundled locally instead of fetched from unpkg.com at runtime - see the
-// matching comment in Present.tsx for why.
-import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
-pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
+pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
 const texts = {
   ku: { scan: 'سکان بکە', session: 'سێشن', slide: 'سلاید', switchLang: 'EN', loading: 'خوێندنەوەی فایلی PDF...', error: 'هەڵە', fullscreen: 'شاشەی تەواو' },

@@ -2,40 +2,28 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import { useParams, useSearchParams } from 'react-router-dom';
 import { QRCodeSVG } from 'qrcode.react';
 import { Document, Page, pdfjs } from 'react-pdf';
-// Bundled locally (same origin as the rest of the app) instead of fetched
-// from unpkg.com at runtime. The unpkg version worked fine on an open
-// connection, but on a locked-down/school network that blocks or throttles
-// third-party CDNs, that fetch can silently fail - the PDF worker never
-// loads, so PDF pages never render, while images (which don't need any
-// worker) keep working fine. This is the same class of problem the
-// crypto.getRandomValues polyfill in index.html works around.
-import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { supabase } from './supabaseClient';
 import { QuizReportCard, exportReportPDF, exportReportPNG, type QuizReportData } from './quizReport';
 import { recordSavedItem } from './Account';
-import type { SlideTransition, SlideBuilds, BuildRegion } from './pptxParse';
+import type { SlideTransition, SlideBuildInfo } from './pptxParse';
+import { computeNext, computePrev, computeJump } from './buildNav';
+import BuildRevealOverlay from './BuildRevealOverlay';
 
 // Best-effort lookup of whatever extractPptxMeta (see FileUpload.tsx) saved
 // for a given uploaded file - speaker notes, transition info, and build
-// (bullet/object entrance) steps, keyed by slide/page number. Returns empty
+// (bullet/object reveal) info, keyed by slide/page number. Returns empty
 // maps (never throws) if the table doesn't exist yet, the file wasn't a
 // pptx, or nothing was ever saved for it - none of that should ever block a
 // slide from loading.
-async function fetchPptxMeta(fileId: string): Promise<{ notesByPage: Record<number, string>; transitionsByPage: Record<number, SlideTransition>; buildsByPage: Record<number, SlideBuilds> }> {
+async function fetchPptxMeta(fileId: string): Promise<{ notesByPage: Record<number, string>; transitionsByPage: Record<number, SlideTransition>; buildsByPage: Record<number, SlideBuildInfo> }> {
   const empty = { notesByPage: {}, transitionsByPage: {}, buildsByPage: {} };
   try {
-    let { data, error } = await supabase.from('pptx_meta').select('notes, transitions, builds').eq('file_id', fileId).maybeSingle();
-    if (error) {
-      // The `builds` column may not exist yet if supabase_migration_builds.sql
-      // hasn't been run - fall back to the original two columns so notes and
-      // transitions keep working exactly as before either way.
-      ({ data, error } = await supabase.from('pptx_meta').select('notes, transitions').eq('file_id', fileId).maybeSingle());
-    }
+    const { data, error } = await supabase.from('pptx_meta').select('notes, transitions, builds').eq('file_id', fileId).maybeSingle();
     if (error || !data) return empty;
     return {
       notesByPage: (data.notes as Record<number, string>) || {},
       transitionsByPage: (data.transitions as Record<number, SlideTransition>) || {},
-      buildsByPage: ((data as { builds?: Record<number, SlideBuilds> }).builds) || {},
+      buildsByPage: (data.builds as Record<number, SlideBuildInfo>) || {},
     };
   } catch {
     return empty;
@@ -73,7 +61,7 @@ function playQuestionStartChime() { playBeep(523, 100, 0.12); setTimeout(() => p
 function playTickBeep(urgent: boolean) { playBeep(urgent ? 660 : 440, 110, urgent ? 0.18 : 0.1); }
 function playTimesUpChime() { playBeep(880, 150, 0.16); setTimeout(() => playBeep(392, 320, 0.16), 160); }
 
-pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
+pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
 // Same deployment URL as FileUpload.tsx - keep these in sync.
 const GAS_URL = 'https://script.google.com/macros/s/AKfycbx48s5aNamkERYuvJ-BE7-RBF2zt15mFZ-C-SXL_UIGZkG46RdyuPYIOlO6o0HZcr3N/exec';
@@ -104,7 +92,7 @@ interface FlatSlide {
   name?: string;
   notes?: string;
   transition?: SlideTransition; // this slide's own PPTX transition - how it should animate IN when navigated to
-  builds?: SlideBuilds; // this slide's bullet/object entrance steps, if any - see pptxParse.ts
+  build?: SlideBuildInfo; // click-triggered bullet/object reveal steps, if any (see pptxParse.ts)
   thumbnail?: string; // small data-URL preview, shown on the remote's thumbnail strip
 }
 
@@ -361,134 +349,13 @@ const TRANSITION_KEYFRAMES_CSS = `
 @keyframes nextslide-slide-in-d { from { transform: translateY(-6%); opacity: 0.3; } to { transform: translateY(0); opacity: 1; } }
 `;
 
-// --- Build-step (bullet/object entrance) overlay ---------------------------
-//
-// Renders one absolutely-positioned "mask" box per not-yet-revealed region,
-// sized/positioned in percent (see pptxParse.ts - these come straight from
-// each shape's real EMU position against the slide canvas, so they line up
-// with the rendered PDF page at any size). Each mask samples the actual
-// pixel color from the already-rendered page canvas near its own edge, so
-// it hides content by genuinely matching the slide - a black background
-// stays black, white stays white, a photo background samples close to
-// whatever's actually there - rather than assuming one fixed color.
-//
-// Nothing here re-renders any text or shape - the PDF page underneath
-// already has everything laid out with the right fonts. A mask is just
-// removed (fades/drifts away) once its step is revealed, which is what
-// makes the *real*, already-typeset content appear.
-function sampleRegionColor(ctx: CanvasRenderingContext2D, canvasW: number, canvasH: number, region: BuildRegion): string {
-  const candidates: Array<[number, number]> = [
-    [region.xPct, Math.max(region.yPct - 1.5, 0.3)],
-    [Math.max(region.xPct - 1.5, 0.3), region.yPct],
-    [Math.min(region.xPct + 0.5, 99.5), Math.min(region.yPct + 0.5, 99.5)],
-  ];
-  for (const [xPct, yPct] of candidates) {
-    try {
-      const x = Math.min(Math.max(Math.round((xPct / 100) * canvasW), 0), canvasW - 1);
-      const y = Math.min(Math.max(Math.round((yPct / 100) * canvasH), 0), canvasH - 1);
-      const d = ctx.getImageData(x, y, 1, 1).data;
-      return `rgb(${d[0]}, ${d[1]}, ${d[2]})`;
-    } catch {
-      continue; // shouldn't happen for a same-origin blob URL, but never let a sampling hiccup break rendering
-    }
-  }
-  return '#ffffff';
-}
-
-function buildMaskStyle(region: BuildRegion, color: string, revealed: boolean): CSSProperties {
-  const base: CSSProperties = {
-    position: 'absolute',
-    left: `${region.xPct}%`,
-    top: `${region.yPct}%`,
-    width: `${region.wPct}%`,
-    height: `${region.hPct}%`,
-    background: color,
-    opacity: revealed ? 0 : 1,
-    pointerEvents: 'none',
-  };
-  if (region.effect === 'appear') return { ...base, transition: 'opacity 80ms linear' };
-  if (region.effect === 'fade') return { ...base, transition: 'opacity 300ms ease' };
-  // fly / wipe - approximated with a small drift alongside the fade, since
-  // the real motion direction isn't something we confidently know from the
-  // file (see detectEffect in pptxParse.ts).
-  return {
-    ...base,
-    transform: revealed ? 'translateY(-6px)' : 'translateY(0)',
-    transition: 'opacity 300ms ease, transform 300ms ease',
-  };
-}
-
-function BuildOverlay({
-  flatIndex,
-  builds,
-  revealedSteps,
-  pageWrapperRef,
-  colorCacheRef,
-}: {
-  flatIndex: number;
-  builds: SlideBuilds;
-  revealedSteps: number;
-  pageWrapperRef: React.RefObject<HTMLDivElement | null>;
-  colorCacheRef: React.MutableRefObject<Map<string, string>>;
-}) {
-  const [colors, setColors] = useState<Record<string, string>>({});
-
-  useEffect(() => {
-    let cancelled = false;
-    let attempts = 0;
-    let intervalId: ReturnType<typeof setInterval> | null = null;
-
-    const trySample = () => {
-      const canvas = pageWrapperRef.current?.querySelector('canvas');
-      const ctx = canvas?.getContext('2d');
-      if (!canvas || !ctx || !canvas.width || !canvas.height) return false;
-      const next: Record<string, string> = {};
-      builds.steps.forEach((step, si) => {
-        step.regions.forEach((region, ri) => {
-          const key = `${flatIndex}:${si}:${ri}`;
-          const cached = colorCacheRef.current.get(key);
-          const color = cached || sampleRegionColor(ctx, canvas.width, canvas.height, region);
-          if (!cached) colorCacheRef.current.set(key, color);
-          next[key] = color;
-        });
-      });
-      if (!cancelled) setColors(next);
-      return true;
-    };
-
-    // The page's canvas may not have finished painting yet on first mount -
-    // a handful of quick retries covers that without ever blocking the
-    // occlusion boxes from showing up (they render with a plain white
-    // fallback in the meantime, then correct themselves once sampled).
-    if (!trySample()) {
-      intervalId = setInterval(() => {
-        attempts += 1;
-        if (trySample() || attempts > 15) { if (intervalId) clearInterval(intervalId); }
-      }, 100);
-    }
-    return () => { cancelled = true; if (intervalId) clearInterval(intervalId); };
-  }, [flatIndex, builds, pageWrapperRef, colorCacheRef]);
-
-  return (
-    <div className="absolute inset-0" aria-hidden="true">
-      {builds.steps.map((step, si) =>
-        step.regions.map((region, ri) => {
-          const key = `${flatIndex}:${si}:${ri}`;
-          return <div key={key} style={buildMaskStyle(region, colors[key] || '#ffffff', si < revealedSteps)} />;
-        })
-      )}
-    </div>
-  );
-}
-
 function withPlaybackParams(embedUrl: string, platform?: string): string {
   try {
     const url = new URL(embedUrl);
-    if (isYouTubeEmbed(embedUrl, platform)) {
+    if (platform === 'youtube' || url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be')) {
       url.searchParams.set('enablejsapi', '1');
       url.searchParams.set('autoplay', '1');
       url.searchParams.set('playsinline', '1');
-      url.searchParams.set('origin', window.location.origin);
       return url.toString();
     }
     return embedUrl;
@@ -497,44 +364,9 @@ function withPlaybackParams(embedUrl: string, platform?: string): string {
   }
 }
 
-function isYouTubeEmbed(embedUrl: string, platform?: string): boolean {
-  try {
-    const url = new URL(embedUrl);
-    return platform === 'youtube' || url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be');
-  } catch {
-    return false;
-  }
-}
-
-// Loads YouTube's official IFrame Player API script once (safe to call
-// repeatedly/concurrently - later callers just await the same promise) and
-// resolves once window.YT.Player is actually usable. This replaces the old
-// approach of hand-rolling postMessage({event:'listening'}) pings and
-// sniffing raw 'infoDelivery' messages, which only worked once the player
-// happened to volunteer one on its own - in practice that meant the phone's
-// progress bar stayed empty until something like a seek nudged it into
-// talking. The real API fires a proper onReady event as soon as metadata
-// is available, and getCurrentTime()/getDuration()/getVolume() can just be
-// asked for directly instead of guessed at from whatever last flew by.
-let ytApiLoadPromise: Promise<void> | null = null;
-function loadYouTubeIframeAPI(): Promise<void> {
-  if (typeof window === 'undefined') return Promise.resolve();
-  const w = window as any;
-  if (w.YT && w.YT.Player) return Promise.resolve();
-  if (ytApiLoadPromise) return ytApiLoadPromise;
-  ytApiLoadPromise = new Promise((resolve) => {
-    const previous = w.onYouTubeIframeAPIReady;
-    w.onYouTubeIframeAPIReady = () => {
-      previous?.();
-      resolve();
-    };
-    if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) {
-      const tag = document.createElement('script');
-      tag.src = 'https://www.youtube.com/iframe_api';
-      document.head.appendChild(tag);
-    }
-  });
-  return ytApiLoadPromise;
+function postYouTubeCommand(iframe: HTMLIFrameElement | null, func: string, args: any[] = []) {
+  if (!iframe || !iframe.contentWindow) return;
+  iframe.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args }), '*');
 }
 
 export default function Present() {
@@ -564,6 +396,32 @@ export default function Present() {
   const flatSlidesRef = useRef<FlatSlide[]>([]);
   useEffect(() => { flatSlidesRef.current = flatSlides; }, [flatSlides]);
 
+  // Build (bullet/object reveal) animation state - how many of the current
+  // slide's build steps have been clicked through so far. 0 = just the base
+  // slide, before any of its own animations have played.
+  const [buildStep, setBuildStep] = useState(0);
+  const buildStepRef = useRef(0);
+  useEffect(() => { buildStepRef.current = buildStep; }, [buildStep]);
+  // The actual rendered <canvas> for the current PDF page (via react-pdf's
+  // canvasRef), and a tick that bumps every time it's freshly finished
+  // rendering - both feed BuildRevealOverlay's pixel sampling.
+  const [buildCanvasEl, setBuildCanvasEl] = useState<HTMLCanvasElement | null>(null);
+  const [buildRenderTick, setBuildRenderTick] = useState(0);
+
+  // goNext/goPrev/goToFlatIndex all set buildStep to a correct, non-zero
+  // value themselves whenever the slide they land on has builds - the only
+  // time buildStep can be left at its just-mounted default of 0 despite the
+  // current slide actually having builds is the initial render, before
+  // flatSlides (and this slide's build metadata) has finished loading.
+  // Catch that one case here instead of complicating every navigation path.
+  useEffect(() => {
+    const steps = flatSlides[currentFlatIndex]?.build?.steps.length || 0;
+    if (steps > 0 && buildStep === 0) {
+      setBuildStep(1);
+      buildStepRef.current = 1;
+    }
+  }, [flatSlides, currentFlatIndex, buildStep]);
+
   // Caches every lesson item we've already downloaded (built up while
   // preparing flatSlides) so switching to an already-visited item is
   // instant instead of re-fetching.
@@ -578,32 +436,6 @@ export default function Present() {
   // inside the mount-once broadcast handlers below (declared ahead of them
   // on purpose, even though currentFlatIndex itself is computed further down).
   const currentFlatIndexRef = useRef(0);
-
-  // --- Build-step (bullet/object entrance) reveal state ---------------------
-  // How many of the CURRENT flat slide's build steps have been revealed.
-  // Reset whenever currentFlatIndex actually changes (see the effect near
-  // goNext/goPrev below) - forward entry starts at 0 (nothing revealed yet,
-  // matching real PowerPoint), everything else (backing up into a slide,
-  // or any direct jump - thumbnail tap, First/Last, remote slide_change)
-  // lands "fully built", also matching real PowerPoint.
-  const [revealedSteps, setRevealedSteps] = useState(0);
-  const revealedStepsRef = useRef(0);
-  useEffect(() => { revealedStepsRef.current = revealedSteps; }, [revealedSteps]);
-  const prevFlatIndexRef = useRef(0);
-  const nextEntryModeRef = useRef<'fresh' | 'full'>('full');
-
-  // Stale-closure-free copies of goNext/goPrev (defined further down) for
-  // the mount-once realtime listener to call - same pattern as
-  // currentFlatIndexRef/flatSlidesRef above.
-  const goNextRef = useRef<() => void>(() => {});
-  const goPrevRef = useRef<() => void>(() => {});
-
-  // Sampled background color per masked region, so an occlusion box hides
-  // content by actually matching the slide (black stays black, white stays
-  // white, a photo background samples something close) instead of assuming
-  // one fixed color. Keyed by `${flatIndex}:${stepIndex}:${regionIndex}`,
-  // populated by BuildOverlay once the PDF page canvas has actually painted.
-  const regionColorCacheRef = useRef<Map<string, string>>(new Map());
 
   // --- New presentation-tools state (laser/draw already existed on the
   // remote; everything else here is new) ---------------------------------
@@ -629,9 +461,6 @@ export default function Present() {
   // strokes rendering much darker than their final, redrawn appearance).
   const lastStrokePxRef = useRef<{ x: number; y: number } | null>(null);
   const videoIframeRef = useRef<HTMLIFrameElement>(null);
-  // The real YT.Player instance bound to videoIframeRef - see the effect
-  // further down that creates/destroys it as video slides come and go.
-  const ytPlayerRef = useRef<any>(null);
 
   const sessionStateSaveTimer = useRef<any>(null);
 
@@ -648,11 +477,6 @@ export default function Present() {
   const remoteUrl = `${window.location.origin}${window.location.pathname}#/remote?session=${sessionId}`;
   const audienceUrl = `${window.location.origin}${window.location.pathname}#/audience?session=${sessionId}`;
   const wrapperRef = useRef<HTMLDivElement>(null);
-  // Wraps just the <Page> element (shrink-wrapped to its actual rendered
-  // size, not the wider flex container around it) so BuildOverlay's percent
-  // coordinates land on the real slide box, and so it can find the page's
-  // own <canvas> to sample background colors from.
-  const pageWrapperRef = useRef<HTMLDivElement>(null);
   // Separate from wrapperRef: this is the actual target for the real
   // Fullscreen API (see the comment above the JSX that uses it). wrapperRef
   // itself stays scoped to just the slide area, since it also drives the
@@ -660,17 +484,6 @@ export default function Present() {
   // include the sidebar/quiz-stage would throw off every stroke's x/y math.
   const fullscreenTargetRef = useRef<HTMLDivElement>(null);
   const channelRef = useRef<any>(null);
-
-  // Tracks real OS-level fullscreen (via the Fullscreen API), separate from
-  // focusMode. Used to hide the Prev/Next/slide-name bar so real fullscreen
-  // shows only the slide - the bar is still useful in the normal windowed
-  // view, just not once the browser has taken over the whole screen.
-  const [isFullscreen, setIsFullscreen] = useState(false);
-  useEffect(() => {
-    const handleFullscreenChange = () => setIsFullscreen(!!document.fullscreenElement);
-    document.addEventListener('fullscreenchange', handleFullscreenChange);
-    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
-  }, []);
 
   // Session PIN (soft lock, see the matching comment in MobileRemote.tsx) -
   // generated once when the session row is first created, then persisted
@@ -895,23 +708,11 @@ export default function Present() {
 
   const toggleFullscreen = () => {
     if (!fullscreenTargetRef.current) return;
-    const entering = !document.fullscreenElement;
-    if (entering) {
+    if (!document.fullscreenElement) {
       fullscreenTargetRef.current.requestFullscreen().catch(() => {});
     } else {
       document.exitFullscreen();
     }
-    // Also flip focus mode in lockstep. showNav/the sidebar were only ever
-    // gated on the real Fullscreen API's own isFullscreen flag, which only
-    // updates via a 'fullscreenchange' event - so if this ever runs in a
-    // context where requestFullscreen() is silently blocked/ignored, or the
-    // presenter extends into fullscreen afterward via the browser/OS's own
-    // toggle (F11, which never fires that event on its own), the Prev/Next/
-    // slide-name bar stayed visible. focusMode doesn't depend on any of
-    // that - it hides the chrome immediately and directly, the same way it
-    // already does today when the phone requests it.
-    setFocusMode(entering);
-    channelRef.current?.send({ type: 'broadcast', event: 'fullscreen_state', payload: { active: entering } });
   };
 
   // Theater/focus mode - hides the sidebar so the slide fills the screen.
@@ -950,21 +751,6 @@ export default function Present() {
     const idx = flatSlides.findIndex((s) => s.itemIndex === currentIndex && s.pageInItem === currentPage);
     return idx === -1 ? 0 : idx;
   }, [flatSlides, currentIndex, currentPage]);
-
-  // Guarded on the actual flat index changing (not just flatSlides being
-  // reassigned by the background loading pass) so an in-progress reveal
-  // never gets silently reset by an unrelated slide's metadata finishing
-  // to load. `nextEntryModeRef` is set to 'fresh' by goNext right before it
-  // crosses into a new slide; every other way of arriving at a slide
-  // (goPrev crossing backward, a direct remote jump, First/Last, tapping a
-  // thumbnail) leaves it at the default 'full', landing fully built.
-  useEffect(() => {
-    if (currentFlatIndex === prevFlatIndexRef.current) return;
-    const totalSteps = flatSlides[currentFlatIndex]?.builds?.steps.length ?? 0;
-    setRevealedSteps(nextEntryModeRef.current === 'fresh' ? 0 : totalSteps);
-    nextEntryModeRef.current = 'full';
-    prevFlatIndexRef.current = currentFlatIndex;
-  }, [currentFlatIndex, flatSlides]);
 
   // Redraws every stroke recorded for a given flat slide, in order, so
   // erase strokes (destination-out) correctly cut out whatever was drawn
@@ -1077,23 +863,15 @@ export default function Present() {
         const clamped = Math.min(Math.max(0, flatNum - 1), list.length - 1);
         const target = list[clamped];
         if (!target) return;
+        const step = typeof payload.payload?.step === 'number' ? payload.payload.step : 0;
+        setBuildStep(step);
+        buildStepRef.current = step;
         if (target.itemIndex !== currentIndexRef.current) {
           landOnPageRef.current = target.pageInItem;
           setCurrentIndex(target.itemIndex);
         } else {
           setCurrentPage(target.pageInItem);
         }
-      });
-
-      // Step delegation from the phone's own Next/Prev buttons, used only
-      // for the current slide's build steps (see MobileRemote.tsx) - the
-      // phone can't know on its own whether "next" should reveal a bullet
-      // or cross to a new slide, so it defers to whatever goNext/goPrev
-      // would do locally (same logic as the ArrowRight/ArrowLeft keys).
-      channel.on('broadcast', { event: 'nav_step' }, (payload) => {
-        const dir = payload.payload?.dir;
-        if (dir === 1) goNextRef.current();
-        else if (dir === -1) goPrevRef.current();
       });
 
       channel.on('broadcast', { event: 'laser_move' }, (payload) => {
@@ -1127,31 +905,17 @@ export default function Present() {
 
       channel.on('broadcast', { event: 'video_control' }, (payload) => {
         const { action, value } = payload.payload || {};
-        const player = ytPlayerRef.current;
-        if (!player) return;
-        try {
-          if (action === 'play') player.playVideo();
-          else if (action === 'pause') player.pauseVideo();
-          else if (action === 'seek' && typeof value === 'number') player.seekTo(value, true);
-          else if (action === 'volume' && typeof value === 'number') player.setVolume(value);
-          else if (action === 'mute') player.mute();
-          else if (action === 'unmute') player.unMute();
-        } catch {
-          // Player not fully initialized yet - command is dropped, same
-          // best-effort behavior as before.
-        }
+        const iframe = videoIframeRef.current;
+        if (action === 'play') postYouTubeCommand(iframe, 'playVideo');
+        else if (action === 'pause') postYouTubeCommand(iframe, 'pauseVideo');
+        else if (action === 'seek' && typeof value === 'number') postYouTubeCommand(iframe, 'seekTo', [value, true]);
+        else if (action === 'volume' && typeof value === 'number') postYouTubeCommand(iframe, 'setVolume', [value]);
+        else if (action === 'mute') postYouTubeCommand(iframe, 'mute');
+        else if (action === 'unmute') postYouTubeCommand(iframe, 'unMute');
       });
 
       channel.on('broadcast', { event: 'fullscreen_toggle' }, () => {
         handleFullscreenRequest();
-      });
-
-      // "Start the lesson" button on the phone (see MobileRemote.tsx) - a
-      // plain full page reload of the projector tab. Mainly for the case
-      // where the projector's browser was left open from before, is stuck,
-      // or just needs a clean start right as class begins.
-      channel.on('broadcast', { event: 'presenter_reload' }, () => {
-        window.location.reload();
       });
 
       // Countdown timer mirror - MobileRemote.tsx is authoritative, this
@@ -1396,7 +1160,7 @@ export default function Present() {
   // screen agree on "slide 6", regardless of which lesson item that is.
   useEffect(() => {
     if (!flatSlides.length || !activeFileId) return;
-    supabase.from('sessions').upsert({ id: sessionId, file_id: activeFileId, current_slide: currentFlatIndex + 1 });
+    supabase.from('sessions').upsert({ id: sessionId, file_id: activeFileId, current_slide: currentFlatIndex + 1, build_step: buildStep });
     // fileId is included here (not just the slide number) so the remote can
     // tell when the presenter has switched to a different lesson item -
     // without this, the phone has no way to know its cached preview is now
@@ -1406,9 +1170,9 @@ export default function Present() {
     channelRef.current?.send({
       type: 'broadcast',
       event: 'slide_change',
-      payload: { slide: currentFlatIndex + 1, fileId: activeFileId },
+      payload: { slide: currentFlatIndex + 1, fileId: activeFileId, step: buildStep },
     });
-  }, [currentFlatIndex, activeFileId, flatSlides.length, sessionId]);
+  }, [currentFlatIndex, buildStep, activeFileId, flatSlides.length, sessionId]);
 
   // Share the flat slide list itself with the remote (thumbnail strip,
   // total count, per-slide type/name/notes) whenever it's built or changes.
@@ -1456,61 +1220,52 @@ export default function Present() {
     };
   }, [currentFlatIndex, redrawCanvasForSlide]);
 
-  // Creates a real YT.Player bound to the video iframe whenever a YouTube
-  // slide is on screen, and tears it down when that slide goes away. Once
-  // it's ready, onReady/onStateChange plus a 400ms poll keep videoState
-  // (playing/time/duration/volume) accurate and broadcast to the phone -
-  // this is what makes the remote's progress bar show up reliably and its
-  // volume slider actually track the real level, instead of both sitting
-  // frozen until some other action happened to jostle the old postMessage
-  // listener into life.
+  // Listens for YouTube's postMessage player updates so we can relay
+  // play/pause/time/duration back to the phone remote's progress bar.
+  // Only fires for YouTube embeds with enablejsapi=1 (see withPlaybackParams).
+  useEffect(() => {
+    let lastBroadcast = 0;
+    let lastPlayerState: number | null = null;
+    function handleMessage(e: MessageEvent) {
+      if (typeof e.data !== 'string') return;
+      let data: any;
+      try { data = JSON.parse(e.data); } catch { return; }
+      if (data.event !== 'infoDelivery' || !data.info) return;
+      const now = Date.now();
+      const stateChanged = data.info.playerState !== lastPlayerState;
+      // Always let an actual play/pause/state transition through immediately -
+      // only the repetitive "still playing at time X" ticks get throttled.
+      // Otherwise a quick pause right after a play can land inside the
+      // throttle window and get silently dropped, leaving the remote's
+      // Play/Pause button stuck showing the wrong state until the next tick.
+      if (!stateChanged && now - lastBroadcast < 900) return;
+      lastBroadcast = now;
+      lastPlayerState = data.info.playerState;
+      const next: VideoState = {
+        playing: data.info.playerState === 1,
+        time: data.info.currentTime || 0,
+        duration: data.info.duration || 0,
+        volume: typeof data.info.volume === 'number' ? data.info.volume : videoState.volume,
+      };
+      setVideoState(next);
+      channelRef.current?.send({ type: 'broadcast', event: 'video_time_update', payload: next });
+    }
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Establishes the YouTube "listening" handshake once a video-link slide
+  // with jsapi enabled is on screen, so infoDelivery messages start flowing.
   useEffect(() => {
     if (resolved?.fileType !== 'video-link') return;
-    if (!isYouTubeEmbed(resolved.embedUrl, resolved.platform)) return;
     const iframe = videoIframeRef.current;
     if (!iframe) return;
-
-    let cancelled = false;
-    let pollInterval: ReturnType<typeof setInterval> | null = null;
-
-    const syncFromPlayer = () => {
-      const player = ytPlayerRef.current;
-      if (!player || typeof player.getPlayerState !== 'function') return;
-      try {
-        const next: VideoState = {
-          playing: player.getPlayerState() === 1,
-          time: player.getCurrentTime() || 0,
-          duration: player.getDuration() || 0,
-          volume: player.getVolume(),
-        };
-        setVideoState(next);
-        channelRef.current?.send({ type: 'broadcast', event: 'video_time_update', payload: next });
-      } catch {
-        // Player exists but isn't fully initialized yet - next poll retries.
-      }
-    };
-
-    // Reset immediately so the remote doesn't keep showing the previous
-    // video's progress while this one's player spins up.
-    setVideoState(DEFAULT_VIDEO_STATE);
-    channelRef.current?.send({ type: 'broadcast', event: 'video_time_update', payload: DEFAULT_VIDEO_STATE });
-
-    loadYouTubeIframeAPI().then(() => {
-      if (cancelled) return;
-      const YT = (window as any).YT;
-      ytPlayerRef.current = new YT.Player(iframe, {
-        events: { onReady: syncFromPlayer, onStateChange: syncFromPlayer },
-      });
-      pollInterval = setInterval(syncFromPlayer, 400);
-    });
-
-    return () => {
-      cancelled = true;
-      if (pollInterval) clearInterval(pollInterval);
-      try { ytPlayerRef.current?.destroy?.(); } catch { /* iframe already gone */ }
-      ytPlayerRef.current = null;
-    };
-  }, [resolved, currentFlatIndex]);
+    const t = setTimeout(() => {
+      iframe.contentWindow?.postMessage(JSON.stringify({ event: 'listening', id: 'present' }), '*');
+    }, 1000);
+    return () => clearTimeout(t);
+  }, [resolved]);
 
   // Initial load: figure out whether this id is a lesson or a single slide.
   useEffect(() => {
@@ -1620,7 +1375,7 @@ export default function Present() {
             const { notesByPage, transitionsByPage, buildsByPage } = await fetchPptxMeta(ref.fileId);
             for (let p = 1; p <= n; p++) {
               const thumbnail = await renderPdfThumbnail(entry.blobUrl, p);
-              result.push({ itemIndex: i, pageInItem: p, fileType: 'pdf', name: ref.name, notes: notesByPage[p] || ref.notes, transition: transitionsByPage[p], builds: buildsByPage[p], thumbnail });
+              result.push({ itemIndex: i, pageInItem: p, fileType: 'pdf', name: ref.name, notes: notesByPage[p] || ref.notes, transition: transitionsByPage[p], build: buildsByPage[p], thumbnail });
             }
           } else {
             const thumbnail = entry.fileType === 'image' ? await renderImageThumbnail(entry.blobUrl) : undefined;
@@ -1654,7 +1409,7 @@ export default function Present() {
         for (let i = 0; i < numPages; i++) {
           if (cancelled) return;
           const thumbnail = await renderPdfThumbnail(resolved.blobUrl, i + 1);
-          slides.push({ itemIndex: 0, pageInItem: i + 1, fileType: 'pdf', notes: notesByPage[i + 1], transition: transitionsByPage[i + 1], builds: buildsByPage[i + 1], thumbnail });
+          slides.push({ itemIndex: 0, pageInItem: i + 1, fileType: 'pdf', notes: notesByPage[i + 1], transition: transitionsByPage[i + 1], build: buildsByPage[i + 1], thumbnail });
           if (!cancelled) setFlatSlides([...slides]);
         }
       } else if (resolved.fileType === 'image') {
@@ -1706,7 +1461,7 @@ export default function Present() {
 
   // Jump straight to any global slide number - used by both the Prev/Next
   // buttons below and incoming remote slide_change events.
-  const goToFlatIndex = useCallback((flatIdx: number) => {
+  const goToFlatIndex = useCallback((flatIdx: number, nextBuildStep?: number) => {
     const list = flatSlides;
     if (!list.length) return;
     const clamped = Math.min(Math.max(0, flatIdx), list.length - 1);
@@ -1717,18 +1472,22 @@ export default function Present() {
     } else {
       setCurrentPage(target.pageInItem);
     }
+    // Jumping straight to a slide (as opposed to clicking through it one
+    // build at a time) lands it fully built by default, same as PowerPoint -
+    // unless the caller already knows exactly which step to land on (e.g.
+    // goNext/goPrev below, mid-build on the same slide).
+    const resolvedStep = nextBuildStep ?? computeJump(list, clamped).buildStep;
+    setBuildStep(resolvedStep);
+    buildStepRef.current = resolvedStep;
   }, [flatSlides, currentIndex]);
 
   const goPrev = useCallback(() => {
-    // Un-reveal one build step at a time before actually leaving the slide -
-    // mirrors real PowerPoint (Back arrow first walks the current slide's
-    // animations backward, only then moves to the previous slide).
-    const totalSteps = flatSlides[currentFlatIndex]?.builds?.steps.length ?? 0;
-    if (totalSteps > 0 && revealedStepsRef.current > 0) {
-      setRevealedSteps((n) => n - 1);
+    if (flatSlides.length) {
+      const { flatIdx, buildStep: nextStep } = computePrev(flatSlides, currentFlatIndex, buildStepRef.current);
+      if (flatIdx === currentFlatIndex) { setBuildStep(nextStep); buildStepRef.current = nextStep; }
+      else goToFlatIndex(flatIdx, nextStep);
       return;
     }
-    if (flatSlides.length) { goToFlatIndex(currentFlatIndex - 1); return; }
     // Fallback for the brief window before flatSlides has been prepared.
     if (resolved?.fileType === 'pdf' && currentPage > 1) { setCurrentPage(currentPage - 1); return; }
     if (!lessonSlides || currentIndex === 0) return;
@@ -1736,24 +1495,16 @@ export default function Present() {
   }, [flatSlides, currentFlatIndex, goToFlatIndex, resolved, currentPage, lessonSlides, currentIndex]);
 
   const goNext = useCallback(() => {
-    // Reveal the next build step in place before actually advancing -
-    // once every step on this slide has been shown, fall through to the
-    // normal cross-slide advance below (which plays that slide's transition
-    // exactly as it does today for non-animated content).
-    const totalSteps = flatSlides[currentFlatIndex]?.builds?.steps.length ?? 0;
-    if (totalSteps > 0 && revealedStepsRef.current < totalSteps) {
-      setRevealedSteps((n) => n + 1);
+    if (flatSlides.length) {
+      const { flatIdx, buildStep: nextStep } = computeNext(flatSlides, currentFlatIndex, buildStepRef.current);
+      if (flatIdx === currentFlatIndex) { setBuildStep(nextStep); buildStepRef.current = nextStep; }
+      else goToFlatIndex(flatIdx, nextStep);
       return;
     }
-    if (flatSlides.length) { nextEntryModeRef.current = 'fresh'; goToFlatIndex(currentFlatIndex + 1); return; }
     if (resolved?.fileType === 'pdf' && numPages && currentPage < numPages) { setCurrentPage(currentPage + 1); return; }
     if (!lessonSlides || currentIndex >= lessonSlides.length - 1) return;
     setCurrentIndex((i) => i + 1);
   }, [flatSlides, currentFlatIndex, goToFlatIndex, resolved, numPages, currentPage, lessonSlides, currentIndex]);
-
-  // Keep the stale-closure-free copies in sync for the mount-once remote
-  // listener (see the 'nav_step' handler above) to call.
-  useEffect(() => { goNextRef.current = goNext; goPrevRef.current = goPrev; }, [goNext, goPrev]);
 
   // Keyboard shortcuts on the main screen: arrows to navigate, B/W for
   // black/white screen, Escape to restore to color.
@@ -1796,10 +1547,7 @@ export default function Present() {
     }
   };
 
-  // Hidden once the browser is truly fullscreen or the phone has put us in
-  // focus mode - both cases want the slide to fill the whole screen with no
-  // chrome. Prev/Next still work via keyboard arrows and the phone remote.
-  const showNav = flatSlides.length > 1 && !isFullscreen && !focusMode;
+  const showNav = flatSlides.length > 1;
   const isFirstSlide = flatSlides.length ? currentFlatIndex === 0 : currentIndex === 0;
   const isLastSlide = flatSlides.length ? currentFlatIndex === flatSlides.length - 1 : true;
 
@@ -1808,6 +1556,8 @@ export default function Present() {
     navLabel = `Slide ${currentFlatIndex + 1} of ${flatSlides.length}`;
     if (resolved?.name) navLabel += ` - ${resolved.name}`;
   }
+  const currentBuildStepCount = flatSlides[currentFlatIndex]?.build?.steps.length || 0;
+  if (currentBuildStepCount > 0) navLabel += ` \u00b7 Build ${Math.min(buildStep, currentBuildStepCount)}/${currentBuildStepCount}`;
 
   const zoomTransform = `scale(${zoom.scale}) translate(${zoom.x}%, ${zoom.y}%)`;
 
@@ -1936,30 +1686,34 @@ export default function Present() {
             <div key={currentFlatIndex} className="w-full h-full flex items-center justify-center" style={transitionAnimationStyle(flatSlides[currentFlatIndex]?.transition)}>
             {!loading && !error && resolved?.fileType === 'pdf' && (
               <div className="w-full h-full flex items-center justify-center overflow-auto bg-white">
-                <Document
-                  file={resolved.blobUrl}
-                  loading={<div className="p-12 text-black">Loading PDF...</div>}
-                  onLoadSuccess={onPdfLoadSuccess}
-                  onLoadError={(err) => setError(`PDF error: ${err.message}`)}
-                >
-                  <div ref={pageWrapperRef} style={{ position: 'relative', display: 'inline-block', lineHeight: 0 }}>
+                <div style={{ position: 'relative', display: 'inline-block' }}>
+                  <Document
+                    file={resolved.blobUrl}
+                    loading={<div className="p-12 text-black">Loading PDF...</div>}
+                    onLoadSuccess={onPdfLoadSuccess}
+                    onLoadError={(err) => setError(`PDF error: ${err.message}`)}
+                  >
                     <Page
                       pageNumber={currentPage}
                       renderTextLayer={false}
                       renderAnnotationLayer={false}
                       height={window.innerHeight * 0.85}
+                      canvasRef={setBuildCanvasEl}
+                      onRenderSuccess={() => setBuildRenderTick((t) => t + 1)}
                     />
-                    {!!flatSlides[currentFlatIndex]?.builds?.steps.length && (
-                      <BuildOverlay
-                        flatIndex={currentFlatIndex}
-                        builds={flatSlides[currentFlatIndex]!.builds!}
-                        revealedSteps={revealedSteps}
-                        pageWrapperRef={pageWrapperRef}
-                        colorCacheRef={regionColorCacheRef}
-                      />
-                    )}
-                  </div>
-                </Document>
+                  </Document>
+                  {/* Build (bullet/object reveal) animation - covers not-yet-
+                      revealed regions with a color sampled from this exact
+                      rendered slide, so it needs no font/theme reconstruction
+                      and bows out on its own for anything it can't mask
+                      confidently (see BuildRevealOverlay.tsx). */}
+                  <BuildRevealOverlay
+                    build={flatSlides[currentFlatIndex]?.build}
+                    buildStep={buildStep}
+                    canvasEl={buildCanvasEl}
+                    renderTick={buildRenderTick}
+                  />
+                </div>
               </div>
             )}
 
